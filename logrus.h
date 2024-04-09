@@ -8,6 +8,8 @@
 // Date:    2024/02/06 14:49:29
 //===----------------------------------------------------------------------===//
 
+#pragma once
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -239,8 +241,8 @@ inline Entry with_error(int errnum) { return sl().with_error(errnum); }
 
 #define LOGRUS_DECLARE_LOG_WITH_LOC(logfunc)                                   \
   template <size_t N>                                                          \
-  void logfunc(const char *file, int line, const char *func,                   \
-               const char(&msg)[N]) {                                          \
+  inline void logfunc(const char *file, int line, const char *func,            \
+                      const char(&msg)[N]) {                                   \
     return sl().logfunc(file, line, func, msg);                                \
   }
 
@@ -254,7 +256,7 @@ LOGRUS_DECLARE_LOG_WITH_LOC(fatal);
 
 #define LOGRUS_DECLARE_LOG(logfunc)                                            \
   template <size_t N>                                                          \
-  void logfunc(const char(&msg)[N]) {                                          \
+  inline void logfunc(const char(&msg)[N]) {                                   \
     return sl().logfunc(msg);                                                  \
   }
 

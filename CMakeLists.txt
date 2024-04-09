@@ -21,6 +21,7 @@ ExternalProject_Add(libev
         BUILD_COMMAND              ${LIBEV_MAKE}
         INSTALL_COMMAND            ${LIBEV_INSTALL}
         DOWNLOAD_EXTRACT_TIMESTAMP ""
+        URL_HASH                   ""
 )
 
 include_directories(${LIBEV_INCLUDE_DIR})

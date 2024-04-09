@@ -126,6 +126,8 @@ struct TCPConn {
   struct ev_io io;
   uint64_t read_count;
   uint64_t write_count;
+  bool read_done;
+  bool write_done;
 };
 
 struct TCPConnPair : public std::enable_shared_from_this<TCPConnPair> {
@@ -134,7 +136,7 @@ struct TCPConnPair : public std::enable_shared_from_this<TCPConnPair> {
 
   TCPConnPair(const TCPConn &from_conn, const TCPConn &to_conn)
       : from(from_conn), to(to_conn) {
-    LOG_DEBUG("TCPConnPair::TCPConnPair",
+    LOG_TRACE("TCPConnPair::TCPConnPair",
               KV("from_remote", from_conn.raddr.format()),
               KV("from_local", from_conn.laddr.format()),
               KV("to_local", to_conn.laddr.format()),
@@ -142,7 +144,7 @@ struct TCPConnPair : public std::enable_shared_from_this<TCPConnPair> {
   }
 
   ~TCPConnPair() {
-    LOG_DEBUG("TCPConnPair::~TCPConnPair", KV("from", from.raddr.format()),
+    LOG_TRACE("TCPConnPair::~TCPConnPair", KV("from", from.raddr.format()),
               KV("to", to.raddr.format()), KV("read", from.read_count),
               KV("write", from.write_count));
   }
@@ -156,33 +158,68 @@ struct LoopContext {
   IPAddr raddr;
 };
 
+void close_conn(TCPConn *from, TCPConn *to) {
+  if (from->read_done && from->write_done)
+    ::close(from->io.fd);
+
+  if (to->read_done && to->write_done)
+    ::close(to->io.fd);
+
+  if (from->read_done && from->write_done && to->read_done && to->write_done) {
+    LOG_DEBUG("Close conn", KV("from", from->raddr.format()),
+              KV("to", to->raddr.format()), KV("from_fd", from->io.fd),
+              KV("to_fd", to->io.fd));
+
+    connections.erase({to->laddr, to->raddr});
+    connections.erase({from->laddr, from->raddr});
+  }
+}
+
 static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
   TCPConn *to = static_cast<TCPConn *>(w->data);
   TCPConn *from = static_cast<TCPConn *>(to->io.data);
-  assert(from->io.fd == w->fd);
+  assert(w == &from->io);
+  assert(w->fd == from->io.fd);
 
   char buf[1024 * 32];
   ssize_t nread = ::read(w->fd, buf, sizeof(buf) - 1);
   switch (nread) {
   case -1:
-    LOG_INFO("Close conn", KV("remote", to->raddr.format()),
-             KV("local", to->laddr.format()), KERR(errno));
-    ev_io_stop(loop, w);
-    close(w->fd);
-    connections.erase({to->laddr, to->raddr});
+    LOG_ERROR("Fail to read", KV("raddr", from->raddr.format()),
+              KV("laddr", from->laddr.format()), KV("fd", from->io.fd),
+              KERR(errno));
+
+    from->read_done = true;
+    from->write_done = true;
+    to->read_done = true;
+    to->write_done = true;
+
+    ::close(from->io.fd);
+    ::close(to->io.fd);
+    ev_io_stop(loop, &from->io);
+    ev_io_stop(loop, &to->io);
+    close_conn(from, to);
     return;
   case 0:
-    LOG_INFO("Close conn", KV("remote", to->raddr.format()),
-             KV("local", to->laddr.format()));
-    ev_io_stop(loop, w);
-    close(w->fd);
-    connections.erase({to->laddr, to->raddr});
+    LOG_DEBUG("Close half conn", KV("read", from->raddr.format()),
+              KV("write", to->raddr.format()));
+
+    from->read_done = true;
+    to->write_done = true;
+
+    ::shutdown(to->io.fd, SHUT_WR);
+    ::shutdown(from->io.fd, SHUT_RD);
+    ev_io_stop(loop, &from->io);
+    close_conn(from, to);
     return;
   default:
     ssize_t nwrite = ::write(to->io.fd, buf, nread);
-    if (nwrite < 0)
+    if (nwrite < 0) {
+      LOG_ERROR("Fail to write", KV("raddr", to->raddr.format()),
+                KV("laddr", to->laddr.format()));
+      // TODO: handle error
       return;
-
+    }
     from->read_count += nread;
     to->write_count += nwrite;
     return;
@@ -218,8 +255,8 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
 
   LoopContext *loop_ctx = static_cast<LoopContext *>(ev_userdata(loop));
 
-  int upstream_fd = create_connection(loop_ctx->laddr, loop_ctx->raddr);
-  if (upstream_fd < 0) {
+  int server_fd = create_connection(loop_ctx->laddr, loop_ctx->raddr);
+  if (server_fd < 0) {
     LOG_ERROR("Fail to connect", KERR(errno),
               KV("src", loop_ctx->laddr.format()),
               KV("dst", loop_ctx->raddr.format()));
@@ -227,22 +264,25 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
     return;
   }
 
-  IPAddr upstream_laddr = get_local_addr(upstream_fd, &err_num);
+  IPAddr server_laddr = get_local_addr(server_fd, &err_num);
   if (err_num) {
     LOG_ERROR("Fail to get local addr", KERR(err_num),
               KV("dst", loop_ctx->raddr.format()));
     ::close(client_fd);
-    ::close(upstream_fd);
+    ::close(server_fd);
     return;
   }
-  LOG_INFO("Connected upstream", KV("local", upstream_laddr.format()),
-           KV("remote", loop_ctx->raddr.format()));
 
-  if (set_nonblock(upstream_fd) < 0) {
+  LOG_DEBUG("Connected server", KV("from", client_raddr.format()),
+            KV("laddr", server_laddr.format()),
+            KV("raddr", loop_ctx->raddr.format()), KV("client_fd", client_fd),
+            KV("server_fd", server_fd));
+
+  if (set_nonblock(server_fd) < 0) {
     LOG_ERROR("Fail to set non block", KERR(err_num),
               KV("dst", loop_ctx->raddr.format()));
     ::close(client_fd);
-    ::close(upstream_fd);
+    ::close(server_fd);
     return;
   }
 
@@ -250,20 +290,20 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
                       .raddr = client_raddr,
                       .read_count = 0,
                       .write_count = 0};
-  TCPConn upstream_conn{.laddr = upstream_laddr,
-                        .raddr = loop_ctx->raddr,
-                        .read_count = 0,
-                        .write_count = 0};
+  TCPConn server_conn{.laddr = server_laddr,
+                      .raddr = loop_ctx->raddr,
+                      .read_count = 0,
+                      .write_count = 0};
 
   std::shared_ptr<TCPConnPair> cp =
-      std::make_shared<TCPConnPair>(client_conn, upstream_conn);
+      std::make_shared<TCPConnPair>(client_conn, server_conn);
   connections[{client_laddr, client_raddr}] = cp;
 
   cp->from.io.data = &cp->to;
   cp->to.io.data = &cp->from;
 
   ev_io_init(&cp->from.io, read_cb, client_fd, EV_READ);
-  ev_io_init(&cp->to.io, read_cb, upstream_fd, EV_READ);
+  ev_io_init(&cp->to.io, read_cb, server_fd, EV_READ);
   ev_io_start(loop, &cp->from.io);
   ev_io_start(loop, &cp->to.io);
 }

@@ -134,9 +134,9 @@ private:
 
 struct IPAddrCompare {
   bool operator()(const IPAddr &l, const IPAddr &r) const {
-    if (l.len() != r.len())
-      return false;
-    return memcpy(l.addr(), r.addr(), l.len()) == 0;
+    if (l.len() < r.len())
+      return true;
+    return memcmp(l.addr(), r.addr(), l.len()) < 0;
   }
 };
 
@@ -147,7 +147,9 @@ struct IPAddrPair {
 
 struct IPAddrPairCompare {
   bool operator()(const IPAddrPair &l, const IPAddrPair &r) const {
-    return IPAddrCompare{}(l.remote, r.remote) && IPAddrCompare{}(l.local, r.local);
+    if (IPAddrCompare{}(l.remote, r.remote))
+      return true;
+    return IPAddrCompare{}(l.local, r.local);
   }
 };
 
