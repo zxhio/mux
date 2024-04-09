@@ -218,9 +218,9 @@ inline void set_pattern(const std::string &pattern) {
 
 inline void set_level(Level level) { sl().set_level(level); }
 
-inline void set_rotating(const std::string &lname, const std::string &fname,
-                         size_t max_file_size, size_t max_files) {
-  sl().set_rotating(lname, fname, max_file_size, max_files);
+inline void set_rotating(const std::string &fname, size_t max_file_size,
+                         size_t max_files) {
+  sl().set_rotating("default", fname, max_file_size, max_files);
 }
 
 template <typename T>

@@ -17,6 +17,7 @@ static struct option opts[] = {
     {"listen", required_argument, NULL, 'l'},
     {"dst", required_argument, NULL, 'd'},
     {"src", optional_argument, NULL, 's'},
+    {"file", optional_argument, NULL, 'f'},
     {"verbose", no_argument, NULL, 'V'},
     {"help", no_argument, NULL, 'h'},
     {0, 0, 0, 0},
@@ -27,6 +28,7 @@ static void usage(char *argv1) {
   fprintf(stderr, "  -l,  --listen     Listen address or port\n");
   fprintf(stderr, "  -d,  --dst        Destination address\n");
   fprintf(stderr, "  -s,  --src        Source address or ip\n");
+  fprintf(stderr, "  -f,  --file       Log file path\n");
   fprintf(stderr, "  -V,  --verbose    Verbose output\n");
   fprintf(stderr, "  -h,  --help       Help\n");
 }
@@ -314,10 +316,11 @@ int main(int argc, char *argv[]) {
   IPAddr listen_addr;
   IPAddr src_addr;
   IPAddr dst_addr;
+  std::string logfile;
 
   while (1) {
     int this_option_optind = optind ? optind : 1;
-    int c = getopt_long(argc, argv, "l:d:s:Vh", opts, NULL);
+    int c = getopt_long(argc, argv, "l:d:s:f:Vh", opts, NULL);
     if (c < 0)
       break;
 
@@ -335,6 +338,9 @@ int main(int argc, char *argv[]) {
       src_addr = parse_addr_args(arg, &err_num);
       INVALID_ARG_CHECK_RET("src address", arg, err_num);
       break;
+    case 'f':
+      logfile = arg;
+      break;
     case 'V':
       verbose = true;
       break;
@@ -347,9 +353,12 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  if (logfile.length() > 0)
+    logrus::set_rotating(logfile, 1024 * 1024 * 10, 10);
   if (verbose)
     logrus::set_level(logrus::kTrace);
   logrus::set_pattern("%^%l%$ %Y%m%d %H:%M:%S %t %v");
+  logrus::flush_every(std::chrono::seconds(1));
 
   LOG_INFO("=== mux start ===");
   LOG_INFO("Parsed args", KV("listen", listen_addr.format()),
