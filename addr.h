@@ -16,6 +16,7 @@
 #include <sys/un.h>
 
 #include <string>
+#include <system_error>
 
 inline std::string format_mac(uint8_t addr[6]) {
   char buf[18];
@@ -153,49 +154,49 @@ struct IPAddrPairCompare {
   }
 };
 
-#define SET_ERRNO(err_num, no)                                                 \
-  if (err_num)                                                                 \
-    *err_num = no;
-
 inline IPAddr parse_iptext_port(const std::string &iptext, uint16_t port,
-                                int *err_num) {
+                                std::error_code &ec) noexcept {
   IPAddr addr;
   for (const char ch : iptext) {
     if (ch == '.') {
       sockaddr_in in;
       in.sin_family = AF_INET;
       in.sin_port = htons(port);
-      if (::inet_pton(AF_INET, iptext.data(), &in.sin_addr) < 0) {
-        SET_ERRNO(err_num, errno);
-      } else {
+      if (::inet_pton(AF_INET, iptext.data(), &in.sin_addr) < 0)
+        ec = std::error_code(errno, std::system_category());
+      else
         addr = IPAddr(&in);
-        SET_ERRNO(err_num, 0);
-      }
-      break;
+      return addr;
     } else if (ch == ':') {
       sockaddr_in6 in6;
       in6.sin6_family = AF_INET6;
       in6.sin6_port = htons(port);
-      if (::inet_pton(AF_INET6, iptext.data(), &in6.sin6_addr) < 0) {
-        SET_ERRNO(err_num, errno);
-      } else {
+      if (::inet_pton(AF_INET6, iptext.data(), &in6.sin6_addr) < 0)
+        ec = std::error_code(errno, std::system_category());
+      else
         addr = IPAddr(&in6);
-        SET_ERRNO(err_num, 0);
-      }
-      break;
-    } else {
-      SET_ERRNO(err_num, EINVAL);
+      return addr;
     }
   }
+
+  ec = std::error_code(EINVAL, std::system_category());
   return addr;
 }
 
-inline IPAddr get_local_addr(int fd, int *err_num) {
+inline IPAddr parse_iptext_port(const std::string &iptext, uint16_t port) {
+  std::error_code ec;
+  IPAddr addr = parse_iptext_port(iptext, port, ec);
+  if (ec)
+    throw std::system_error(ec);
+  return addr;
+}
+
+inline IPAddr get_local_addr(int fd, std::error_code &ec) noexcept {
   IPAddr addr;
   struct sockaddr_storage ss;
   socklen_t len = sizeof(ss);
   if (getsockname(fd, (struct sockaddr *)&ss, &len) < -1) {
-    SET_ERRNO(err_num, errno);
+    ec = std::error_code(errno, std::system_category());
     return addr;
   }
 
@@ -207,18 +208,26 @@ inline IPAddr get_local_addr(int fd, int *err_num) {
     addr = IPAddr((struct sockaddr_in6 *)&ss);
     break;
   default:
-    SET_ERRNO(err_num, EINVAL);
+    ec = std::error_code(EINVAL, std::system_category());
     break;
   }
   return addr;
 }
 
-inline IPAddr get_remote_addr(int fd, int *err_num) {
+inline IPAddr get_local_addr(int fd) {
+  std::error_code ec;
+  IPAddr addr = get_local_addr(fd, ec);
+  if (ec)
+    throw std::system_error(ec);
+  return addr;
+}
+
+inline IPAddr get_remote_addr(int fd, std::error_code &ec) noexcept {
   IPAddr addr;
   struct sockaddr_storage ss;
   socklen_t len = sizeof(ss);
   if (getpeername(fd, (struct sockaddr *)&ss, &len) < -1) {
-    SET_ERRNO(err_num, errno);
+    ec = std::error_code(errno, std::system_category());
     return addr;
   }
 
@@ -230,8 +239,16 @@ inline IPAddr get_remote_addr(int fd, int *err_num) {
     addr = IPAddr((struct sockaddr_in6 *)&ss);
     break;
   default:
-    SET_ERRNO(err_num, EINVAL);
+    ec = std::error_code(EINVAL, std::system_category());
     break;
   }
+  return addr;
+}
+
+inline IPAddr get_remote_addr(int fd) {
+  std::error_code ec;
+  IPAddr addr = get_remote_addr(fd, ec);
+  if (ec)
+    throw std::system_error(ec);
   return addr;
 }

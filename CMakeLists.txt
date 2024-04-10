@@ -27,6 +27,6 @@ ExternalProject_Add(libev
 include_directories(${LIBEV_INCLUDE_DIR})
 link_directories(${LIBEV_LIB_DIR})
 
-add_executable(${PROJECT_NAME} main.cpp logrus.cpp)
+add_executable(${PROJECT_NAME} main.cpp logrus.cpp proxy.cpp conn.cpp netutil.cpp)
 add_dependencies(${PROJECT_NAME} libev)
 target_link_libraries(${PROJECT_NAME} ev fmt)
