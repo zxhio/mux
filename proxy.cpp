@@ -67,17 +67,15 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
     from->shutdown(SHUT_RD);
     from->detach_loop();
     from->read_done = true;
-    if (from->read_done && from->write_done)
+    if (from->read_done && from->write_done) {
       from->close();
+      from->set_context(std::any());
+    }
 
     to->shutdown(SHUT_WR);
     to->write_done = true;
-    if (to->read_done && to->write_done)
+    if (to->read_done && to->write_done) {
       to->close();
-
-    if (from->read_done && from->write_done && to->read_done &&
-        to->write_done) {
-      from->set_context(std::any());
       to->set_context(std::any());
     }
     break;
