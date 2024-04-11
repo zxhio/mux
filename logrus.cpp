@@ -23,6 +23,7 @@
 #define SPDLOG_SHORT_LEVEL_NAMES                                               \
   { "T", "D", "I", "W", "E", "F", "O" }
 
+#define FMT_HEADER_ONLY
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
