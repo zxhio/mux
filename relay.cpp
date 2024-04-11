@@ -1,23 +1,25 @@
-//===- proxy.cpp - TCP Proxy ------------------------------------*- C++ -*-===//
+//===- relay.cpp - TCP Relay ------------------------------------*- C++ -*-===//
 //
 /// \file
-/// Provide connection proxy base handler.
+/// TCP connection relay.
 //
 // Author:  zxh
 // Date:    2024/04/09 22:15:08
 //===----------------------------------------------------------------------===//
 
-#include "proxy.h"
+#include "relay.h"
 #include "conn.h"
 #include "logrus.h"
 #include "netutil.h"
 
+#include <map>
+
 static const size_t kReusableBufferSize = 1024 * 64;
 
 struct LoopContext {
-  IPAddr laddr;
-  IPAddr raddr;
-  std::vector<char> buf; // reuse buf for read
+  std::map<int, RelayIPAddrTuple> relay_addrs; // relay addresses
+  std::map<int, struct ev_io> watchers;        // ev_io watchers
+  std::vector<char> buf;                       // reuse buf for read
 };
 
 struct TCPConnStat : public TCPConn {
@@ -85,7 +87,8 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
   default:
     ssize_t n = to->write(ctx->buf.data(), nread);
     if (n < 0) {
-      LOG_ERROR("Fail to write", KV("laddr", to->local_addr().format()),
+      LOG_ERROR("Fail to write", KERR(errno),
+                KV("laddr", to->local_addr().format()),
                 KV("raddr", to->remote_addr().format()));
       return;
     }
@@ -96,6 +99,12 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
 }
 
 static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
+  LoopContext *loop_ctx = static_cast<LoopContext *>(ev_userdata(loop));
+  const auto &it = loop_ctx->relay_addrs.find(w->fd);
+  if (it == loop_ctx->relay_addrs.end())
+    return;
+  const auto &addr_tuple = it->second;
+
   struct sockaddr_storage addr;
   socklen_t len = sizeof(addr);
 
@@ -122,13 +131,11 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
     return;
   }
 
-  LoopContext *loop_ctx = static_cast<LoopContext *>(ev_userdata(loop));
-
-  int server_fd = create_connection(loop_ctx->laddr, loop_ctx->raddr, ec);
+  int server_fd = create_connection(addr_tuple.src, addr_tuple.dst, ec);
   if (ec) {
     LOG_ERROR("Fail to connect", KERR(errno),
-              KV("src", loop_ctx->laddr.format()),
-              KV("dst", loop_ctx->raddr.format()));
+              KV("saddr", addr_tuple.src.format()),
+              KV("daddr", addr_tuple.dst.format()));
     ::close(client_fd);
     return;
   }
@@ -136,20 +143,20 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
   IPAddr server_laddr = get_local_addr(server_fd, ec);
   if (ec) {
     LOG_ERROR("Fail to get local addr", KERR(ec.value()),
-              KV("dst", loop_ctx->raddr.format()));
+              KV("daddr", addr_tuple.dst.format()));
     ::close(client_fd);
     ::close(server_fd);
     return;
   }
 
-  LOG_DEBUG("Connected server", KV("from", client_raddr.format()),
+  LOG_DEBUG("Connected to server", KV("from", client_raddr.format()),
             KV("laddr", server_laddr.format()),
-            KV("raddr", loop_ctx->raddr.format()), KV("client_fd", client_fd),
+            KV("raddr", addr_tuple.dst.format()), KV("client_fd", client_fd),
             KV("server_fd", server_fd));
 
   if (set_nonblocking(server_fd) < 0) {
     LOG_ERROR("Fail to set non block", KERR(ec.value()),
-              KV("dst", loop_ctx->raddr.format()));
+              KV("dst", addr_tuple.dst.format()));
     ::close(client_fd);
     ::close(server_fd);
     return;
@@ -158,7 +165,7 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
   std::shared_ptr<TCPConnStat> client_conn =
       std::make_shared<TCPConnStat>(client_laddr, client_raddr, client_fd);
   std::shared_ptr<TCPConnStat> server_conn =
-      std::make_shared<TCPConnStat>(server_laddr, loop_ctx->raddr, server_fd);
+      std::make_shared<TCPConnStat>(server_laddr, addr_tuple.dst, server_fd);
 
   client_conn->set_context(server_conn);
   server_conn->set_context(client_conn);
@@ -166,18 +173,17 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
   server_conn->attach_loop(loop, read_cb, EV_READ);
 }
 
-void run_event_loop(int sockfd, const IPAddr &src_addr,
-                    const IPAddr &dst_addr) {
-  LoopContext ctx{.laddr = src_addr,
-                  .raddr = dst_addr,
-                  .buf = std::vector<char>(kReusableBufferSize, 0)};
+void attach_listener(struct ev_loop *loop, int sockfd,
+                     const RelayIPAddrTuple &addr_tuple) {
+  LoopContext *ctx = static_cast<LoopContext *>(ev_userdata(loop));
+  if (!ctx) {
+    ctx = new LoopContext;
+    ctx->buf = std::vector<char>(kReusableBufferSize, 0);
+    ev_set_userdata(loop, ctx);
+  }
 
-  struct ev_loop *loop = ev_default_loop();
-  ev_set_userdata(loop, &ctx);
-
-  struct ev_io io;
-  ev_io_init(&io, accept_cb, sockfd, EV_READ);
-  ev_io_start(loop, &io);
-
-  ev_loop(loop, 0);
+  ctx->relay_addrs[sockfd] = addr_tuple;
+  ctx->watchers[sockfd] = {};
+  ev_io_init(&ctx->watchers[sockfd], accept_cb, sockfd, EV_READ);
+  ev_io_start(loop, &ctx->watchers[sockfd]);
 }

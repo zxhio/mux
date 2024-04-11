@@ -29,6 +29,6 @@ link_directories(${LIBEV_LIB_DIR})
 
 set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++ -static")
 
-add_executable(${PROJECT_NAME} main.cpp logrus.cpp proxy.cpp conn.cpp netutil.cpp)
+add_executable(${PROJECT_NAME} main.cpp logrus.cpp relay.cpp conn.cpp netutil.cpp)
 add_dependencies(${PROJECT_NAME} libev)
 target_link_libraries(${PROJECT_NAME} ev)

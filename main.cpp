@@ -10,39 +10,44 @@
 #include "conn.h"
 #include "logrus.h"
 #include "netutil.h"
-#include "proxy.h"
+#include "relay.h"
 
 #include <getopt.h>
 #include <stdio.h>
 
-#define INVALID_ARG_CHECK_EXIT(arg_k, arg_v, err_num)                          \
-  if (err_num) {                                                               \
-    fprintf(stderr, "Invalid %s '%s'\n", arg_k, arg_v);                        \
-    exit(1);                                                                   \
-  }
+#include <sstream>
 
 static struct option opts[] = {
     {"listen", required_argument, NULL, 'l'},
     {"dst", required_argument, NULL, 'd'},
     {"src", optional_argument, NULL, 's'},
+    {"relay_list", optional_argument, NULL, 'r'},
     {"file", optional_argument, NULL, 'f'},
     {"verbose", no_argument, NULL, 'V'},
     {"help", no_argument, NULL, 'h'},
     {0, 0, 0, 0},
 };
 
+#define USAGE_LINE(line) fprintf(stderr, "%s\n", line);
+
 static void usage(char *argv1) {
   fprintf(stderr, "Usage: %s\n", argv1);
-  fprintf(stderr, "  -l,  --listen     Listen address or port\n");
-  fprintf(stderr, "  -d,  --dst        Destination address\n");
-  fprintf(stderr, "  -s,  --src        Source address or ip\n");
-  fprintf(stderr, "  -f,  --file       Log file path\n");
-  fprintf(stderr, "  -V,  --verbose    Verbose output\n");
-  fprintf(stderr, "  -h,  --help       Help\n");
+  USAGE_LINE("  -l,  --listen      Listen address or port");
+  USAGE_LINE("  -d,  --dst         Destination address");
+  USAGE_LINE("  -s,  --src         Source address or ip");
+  USAGE_LINE("  -r,  --relay_list  Relay address tuple list [-l,-s,-d/]+");
+  USAGE_LINE("  -f,  --file        Log file path");
+  USAGE_LINE("  -V,  --verbose     Verbose output");
+  USAGE_LINE("  -h,  --help        Help");
 }
 
-static IPAddr must_parse_addr_args(const char *s) {
-  std::string addr_text(s);
+struct CommandArgs {
+  std::vector<RelayIPAddrTuple> addr_tuple_list;
+  std::string logfile;
+  bool verbose;
+};
+
+static IPAddr must_parse_addr(const std::string &addr_text) {
   std::string::size_type n = addr_text.find_last_of(':');
   if (n == std::string::npos) {
     // Only ip
@@ -68,18 +73,57 @@ static IPAddr must_parse_addr_args(const char *s) {
   return parse_iptext_port(ip_part, uint16_t(port));
 }
 
-struct CommandArgs {
-  IPAddr listen_addr;
-  IPAddr dst_addr;
-  IPAddr src_addr;
-  std::string logfile;
-  bool verbose;
-};
+std::vector<std::string> split(const std::string &s, char delim) {
+  std::vector<std::string> ans;
+  std::istringstream stream(s);
+  std::string word;
+  while (getline(stream, word, delim))
+    ans.push_back(word);
+  return ans;
+}
+
+// listen_addr,src_addr,dst_addr/
+// 80,192.168.32.210:8000,192.168.32.251:8000/192.168.32.245:80,192.168.32.251:8000;
+static std::vector<RelayIPAddrTuple> must_parse_addr_tuple(const char *s) {
+  std::vector<RelayIPAddrTuple> addr_tuple_list;
+  std::vector<std::string> tuple_str_list = split(s, '/');
+  for (const auto &tuple_str : tuple_str_list) {
+    std::vector<std::string> addr_str_list = split(tuple_str, ',');
+    if (addr_str_list.size() < 2)
+      throw std::logic_error("tuple address count must > 2");
+
+    RelayIPAddrTuple t;
+    t.listen = must_parse_addr(addr_str_list[0]);
+    if (addr_str_list.size() == 2) {
+      t.dst = must_parse_addr(addr_str_list[1]);
+    } else {
+      t.src = must_parse_addr(addr_str_list[1]);
+      t.dst = must_parse_addr(addr_str_list[2]);
+    }
+    addr_tuple_list.push_back(t);
+  }
+  return addr_tuple_list;
+}
+
+static void
+check_addr_tuple_valid(const std::vector<RelayIPAddrTuple> &addr_tuple_list) {
+  for (const auto &t : addr_tuple_list) {
+    if (t.dst.port() == 0)
+      throw t.dst.format() + "dst_addr port can't be 0";
+
+    std::string addr_text = t.dst.format();
+    if (addr_text.find("0.0.0.0") != std::string::npos)
+      throw std::logic_error(t.dst.format() + " dst_addr ip can't be 0.0.0.0");
+    else if (addr_text.find("[::]") != std::string::npos)
+      throw std::logic_error(t.dst.format() + " dst_addr ip can't be [::]");
+  }
+}
 
 static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
+  RelayIPAddrTuple addr_tuple;
   while (1) {
     int longidnd;
-    int c = getopt_long(argc, argv, "l:d:s:f:Vh", opts, &longidnd);
+    int c = getopt_long(argc, argv, "l:d:s:r:f:Vh", opts, &longidnd);
     if (c < 0)
       break;
     char *arg = optarg ? optarg : argv[optind];
@@ -87,16 +131,19 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
     try {
       switch (c) {
       case 'l':
-        args.listen_addr = must_parse_addr_args(arg);
+        addr_tuple.listen = must_parse_addr(arg);
         break;
       case 'd':
-        args.dst_addr = must_parse_addr_args(arg);
+        addr_tuple.dst = must_parse_addr(arg);
         break;
       case 's':
-        args.src_addr = must_parse_addr_args(arg);
+        addr_tuple.src = must_parse_addr(arg);
         break;
       case 'f':
         args.logfile = arg;
+        break;
+      case 'r':
+        args.addr_tuple_list = must_parse_addr_tuple(arg);
         break;
       case 'V':
         args.verbose = true;
@@ -113,6 +160,18 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
               opts[longidnd].name, arg, e.what());
       exit(1);
     }
+  }
+
+  // address tuple must contains listen_addr and dst_addr
+  if (addr_tuple.listen.addr()->sa_family != AF_UNSPEC &&
+      addr_tuple.dst.addr()->sa_family != AF_UNSPEC)
+    args.addr_tuple_list.push_back(addr_tuple);
+
+  try {
+    check_addr_tuple_valid(args.addr_tuple_list);
+  } catch (const std::exception &e) {
+    fprintf(stderr, "Invalid address (%s)\n", e.what());
+    exit(1);
   }
 }
 
@@ -132,11 +191,18 @@ int main(int argc, char *argv[]) {
   init_logging(args);
   LOG_INFO("=== mux start ===");
 
-  int sockfd = create_and_bind_listener(args.listen_addr, true);
-  if (sockfd < 0)
-    LOG_FATAL("Fatal to listen", KERR(errno));
-  LOG_INFO("Listen on", KV("addr", args.listen_addr.format()));
+  for (const RelayIPAddrTuple &t : args.addr_tuple_list) {
+    LOG_INFO("Listen on", KV("addr", t.listen.format()),
+             KV("src", t.src.format()), KV("dst", t.dst.format()));
 
-  run_event_loop(sockfd, args.src_addr, args.dst_addr);
+    int sockfd = create_and_bind_listener(t.listen, true);
+    if (sockfd < 0)
+      LOG_FATAL("Fatal to listen", KERR(errno), KV("addr", t.listen.format()));
+
+    attach_listener(ev_default_loop(), sockfd, t);
+  }
+  ev_loop(ev_default_loop(), 0);
+
+  LOG_INFO("=== mux quit ===");
   return 0;
 }
