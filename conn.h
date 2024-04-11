@@ -62,7 +62,7 @@ public:
 
   void shutdown(int how) { ::shutdown(io_.fd, how); }
 
-  void join_loop(struct ev_loop *loop, TCPConnIOCallback cb, int revents) {
+  void attach_loop(struct ev_loop *loop, TCPConnIOCallback cb, int revents) {
     io_.data = this;
     ev_set_cb(&io_, cb);
     ev_io_modify(&io_, revents);

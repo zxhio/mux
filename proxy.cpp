@@ -12,9 +12,12 @@
 #include "logrus.h"
 #include "netutil.h"
 
+static const size_t kReusableBufferSize = 1024 * 64;
+
 struct LoopContext {
   IPAddr laddr;
   IPAddr raddr;
+  std::vector<char> buf; // reuse buf for read
 };
 
 struct TCPConnStat : public TCPConn {
@@ -38,12 +41,12 @@ struct TCPConnStat : public TCPConn {
 };
 
 static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
+  LoopContext *ctx = static_cast<LoopContext *>(ev_userdata(loop));
   TCPConnStat *from = static_cast<TCPConnStat *>(w->data);
   std::shared_ptr<TCPConnStat> to =
       std::any_cast<std::shared_ptr<TCPConnStat>>(from->get_context());
 
-  char buf[1024 * 32];
-  ssize_t nread = from->read(buf, sizeof(buf));
+  ssize_t nread = from->read(ctx->buf.data(), ctx->buf.capacity());
   switch (nread) {
   case -1:
     LOG_ERROR("Fail to read", KV("laddr", from->local_addr().format()),
@@ -80,7 +83,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
     }
     break;
   default:
-    ssize_t n = to->write(buf, nread);
+    ssize_t n = to->write(ctx->buf.data(), nread);
     if (n < 0) {
       LOG_ERROR("Fail to write", KV("laddr", to->local_addr().format()),
                 KV("raddr", to->remote_addr().format()));
@@ -159,13 +162,15 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
 
   client_conn->set_context(server_conn);
   server_conn->set_context(client_conn);
-  client_conn->join_loop(loop, read_cb, EV_READ);
-  server_conn->join_loop(loop, read_cb, EV_READ);
+  client_conn->attach_loop(loop, read_cb, EV_READ);
+  server_conn->attach_loop(loop, read_cb, EV_READ);
 }
 
 void run_event_loop(int sockfd, const IPAddr &src_addr,
                     const IPAddr &dst_addr) {
-  LoopContext ctx{.laddr = src_addr, .raddr = dst_addr};
+  LoopContext ctx{.laddr = src_addr,
+                  .raddr = dst_addr,
+                  .buf = std::vector<char>(kReusableBufferSize, 0)};
 
   struct ev_loop *loop = ev_default_loop();
   ev_set_userdata(loop, &ctx);
