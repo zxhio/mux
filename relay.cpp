@@ -12,15 +12,23 @@
 #include "logrus.h"
 #include "netutil.h"
 
-#include <map>
+#include <assert.h>
+#include <sys/eventfd.h>
+
+#include <thread>
 
 static const size_t kReusableBufferSize = 1024 * 64;
 
-struct LoopContext {
-  std::map<int, RelayIPAddrTuple> relay_addrs; // relay addresses
-  std::map<int, struct ev_io> watchers;        // ev_io watchers
-  std::vector<char> buf;                       // reuse buf for read
-};
+static void accept_cb(struct ev_loop *loop, ev_io *w, int revents);
+static void read_cb(struct ev_loop *loop, ev_io *w, int revents);
+static void eventfd_read_cb(struct ev_loop *loop, ev_io *w, int revents);
+
+EventLoop::EventLoop(size_t id, EventLoopPool *p, int efd)
+    : id_(id), pool_(p), loop_(ev_loop_new()), buf_(kReusableBufferSize, 0) {
+  ev_set_userdata(loop_, this);
+  ev_io_init(&efd_io_, eventfd_read_cb, efd, EV_READ);
+  ev_io_start(loop_, &efd_io_);
+}
 
 struct TCPConnStat : public TCPConn {
   uint64_t read_count;
@@ -43,12 +51,12 @@ struct TCPConnStat : public TCPConn {
 };
 
 static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
-  LoopContext *ctx = static_cast<LoopContext *>(ev_userdata(loop));
+  EventLoop *el = static_cast<EventLoop *>(ev_userdata(loop));
   TCPConnStat *from = static_cast<TCPConnStat *>(w->data);
   std::shared_ptr<TCPConnStat> to =
       std::any_cast<std::shared_ptr<TCPConnStat>>(from->get_context());
 
-  ssize_t nread = from->read(ctx->buf.data(), ctx->buf.capacity());
+  ssize_t nread = from->read(el->buf_.data(), el->buf_.capacity());
   switch (nread) {
   case -1:
     LOG_ERROR("Fail to read", KV("laddr", from->local_addr().format()),
@@ -85,7 +93,7 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
     }
     break;
   default:
-    ssize_t n = to->write(ctx->buf.data(), nread);
+    ssize_t n = to->write(el->buf_.data(), nread);
     if (n < 0) {
       LOG_ERROR("Fail to write", KERR(errno),
                 KV("laddr", to->local_addr().format()),
@@ -98,34 +106,39 @@ static void read_cb(struct ev_loop *loop, ev_io *w, int revents) {
   }
 }
 
-static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
-  LoopContext *loop_ctx = static_cast<LoopContext *>(ev_userdata(loop));
-  const auto &it = loop_ctx->relay_addrs.find(w->fd);
-  if (it == loop_ctx->relay_addrs.end())
-    return;
-  const auto &addr_tuple = it->second;
-
-  struct sockaddr_storage addr;
-  socklen_t len = sizeof(addr);
-
-  int client_fd = ::accept(w->fd, (struct sockaddr *)&addr, &len);
-  if (client_fd < 0)
-    return;
-
-  IPAddr client_raddr((struct sockaddr *)&addr, len);
-  LOG_INFO("New conn", KV("from", client_raddr.format()));
-
-  std::error_code ec;
-  IPAddr client_laddr = get_local_addr(client_fd, ec);
-  if (ec) {
-    LOG_ERROR("Fail to get local addr", KERR(ec.value()),
-              KV("from", client_raddr.format()));
-    ::close(client_fd);
+static void eventfd_read_cb(struct ev_loop *loop, ev_io *w, int revents) {
+  eventfd_t value;
+  if (::eventfd_read(w->fd, &value) < 0) {
+    LOG_ERROR("Fail to eventfd_read", KERR(errno));
     return;
   }
 
-  if (set_nonblocking(client_fd) < 0) {
-    LOG_ERROR("Fail to set non block", KERR(ec.value()),
+  int listen_fd = static_cast<int>((value & 0xffffffff00000000) >> 32);
+  int client_fd = static_cast<int>(value & 0x00000000ffffffff);
+
+  EventLoop *el = static_cast<EventLoop *>(ev_userdata(loop));
+  const auto &it = el->relay_addrs_.find(listen_fd);
+  if (it == el->relay_addrs_.end()) {
+    ::close(client_fd);
+    LOG_WARN("Not found relay addr tuple", KV("listen_fd", listen_fd),
+             KV("client_fd", client_fd));
+    return;
+  }
+  const auto &addr_tuple = it->second;
+
+  std::error_code ec;
+  IPAddr client_raddr = get_remote_addr(client_fd, ec);
+  if (ec) {
+    LOG_ERROR("Fail to get client remote addr", KERR(ec.value()),
+              KV("fd", client_fd));
+    ::close(client_fd);
+    return;
+  }
+  LOG_INFO("New conn", KV("from", client_raddr.format()));
+
+  IPAddr client_laddr = get_local_addr(client_fd, ec);
+  if (ec) {
+    LOG_ERROR("Fail to get local addr", KERR(ec.value()), KV("fd", client_fd),
               KV("from", client_raddr.format()));
     ::close(client_fd);
     return;
@@ -173,17 +186,66 @@ static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
   server_conn->attach_loop(loop, read_cb, EV_READ);
 }
 
-void attach_listener(struct ev_loop *loop, int sockfd,
-                     const RelayIPAddrTuple &addr_tuple) {
-  LoopContext *ctx = static_cast<LoopContext *>(ev_userdata(loop));
-  if (!ctx) {
-    ctx = new LoopContext;
-    ctx->buf = std::vector<char>(kReusableBufferSize, 0);
-    ev_set_userdata(loop, ctx);
+static void accept_cb(struct ev_loop *loop, ev_io *w, int revents) {
+  int client_fd = ::accept(w->fd, nullptr, nullptr);
+  if (client_fd < 0) {
+    LOG_ERROR("Fail to accept", KERR(errno), KV("fd", w->fd));
+    return;
   }
 
-  ctx->relay_addrs[sockfd] = addr_tuple;
-  ctx->watchers[sockfd] = {};
-  ev_io_init(&ctx->watchers[sockfd], accept_cb, sockfd, EV_READ);
-  ev_io_start(loop, &ctx->watchers[sockfd]);
+  if (set_nonblocking(client_fd) < 0) {
+    LOG_ERROR("Fail to set non block", KERR(errno), KV("client_fd", client_fd));
+    ::close(client_fd);
+    return;
+  }
+
+  EventLoopPool *p = static_cast<EventLoop *>(ev_userdata(loop))->pool_;
+  p->curr_loop_idx++;
+  const auto &el = p->loops[p->curr_loop_idx % p->loops.size()];
+  LOG_TRACE("Notify event loop to handle", KV("id", el->id_));
+
+  eventfd_t value = 0;
+  value |= static_cast<eventfd_t>(w->fd) << 32 & 0xffffffff00000000;
+  value |= static_cast<eventfd_t>(client_fd & 0x00000000ffffffff);
+  ::eventfd_write(el->efd_io_.fd, value);
+}
+
+EventLoopPool create_event_loop_pool(size_t n) {
+  size_t nloop = std::max(n, size_t(1));
+  LOG_DEBUG("Create event loop pool", KV("size", nloop));
+  EventLoopPool p{.curr_loop_idx = 0};
+  for (size_t i = 0; i < nloop; i++) {
+    int efd = ::eventfd(0, 0);
+    if (efd < 0)
+      throw std::system_error(std::error_code(errno, std::system_category()),
+                              "eventfd");
+    LOG_TRACE("Create event loop", KV("id", i));
+    p.loops.emplace_back(std::make_unique<EventLoop>(i, &p, efd));
+  }
+
+  return p;
+}
+
+void attach_listener(EventLoopPool &p, int listenfd,
+                     const RelayIPAddrTuple &addr_tuple) {
+  assert(p.loops.size() > 0);
+
+  for (auto &loop : p.loops)
+    loop->relay_addrs_[listenfd] = addr_tuple;
+
+  p.watchers[listenfd] = {};
+  ev_io_init(&p.watchers[listenfd], accept_cb, listenfd, EV_READ);
+  ev_io_start(p.loops[0]->loop_, &p.watchers[listenfd]);
+}
+
+void run_event_loop_pool(EventLoopPool &p) {
+  assert(p.loops.size() > 0);
+
+  std::vector<std::thread> threads;
+  for (const auto &el : p.loops) {
+    LOG_DEBUG("Run event loop", KV("id", el->id_));
+    threads.emplace_back(std::thread([&]() { ev_loop(el->loop_, 0); }));
+  }
+  for (auto &t : threads)
+    t.join();
 }

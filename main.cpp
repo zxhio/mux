@@ -128,36 +128,30 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
       break;
     char *arg = optarg ? optarg : argv[optind];
 
-    try {
-      switch (c) {
-      case 'l':
-        addr_tuple.listen = must_parse_addr(arg);
-        break;
-      case 'd':
-        addr_tuple.dst = must_parse_addr(arg);
-        break;
-      case 's':
-        addr_tuple.src = must_parse_addr(arg);
-        break;
-      case 'f':
-        args.logfile = arg;
-        break;
-      case 'r':
-        args.addr_tuple_list = must_parse_addr_tuple(arg);
-        break;
-      case 'V':
-        args.verbose = true;
-        break;
-      case 'h':
-        usage(argv[0]);
-        exit(0);
-      default:
-        usage(argv[0]);
-        exit(1);
-      }
-    } catch (const std::exception &e) {
-      fprintf(stderr, "Invalid option (-%c/--%s) value (%s) %s\n", c,
-              opts[longidnd].name, arg, e.what());
+    switch (c) {
+    case 'l':
+      addr_tuple.listen = must_parse_addr(arg);
+      break;
+    case 'd':
+      addr_tuple.dst = must_parse_addr(arg);
+      break;
+    case 's':
+      addr_tuple.src = must_parse_addr(arg);
+      break;
+    case 'f':
+      args.logfile = arg;
+      break;
+    case 'r':
+      args.addr_tuple_list = must_parse_addr_tuple(arg);
+      break;
+    case 'V':
+      args.verbose = true;
+      break;
+    case 'h':
+      usage(argv[0]);
+      exit(0);
+    default:
+      usage(argv[0]);
       exit(1);
     }
   }
@@ -167,12 +161,7 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
       addr_tuple.dst.addr()->sa_family != AF_UNSPEC)
     args.addr_tuple_list.push_back(addr_tuple);
 
-  try {
-    check_addr_tuple_valid(args.addr_tuple_list);
-  } catch (const std::exception &e) {
-    fprintf(stderr, "Invalid address (%s)\n", e.what());
-    exit(1);
-  }
+  check_addr_tuple_valid(args.addr_tuple_list);
 }
 
 static void init_logging(const CommandArgs &args) {
@@ -184,24 +173,31 @@ static void init_logging(const CommandArgs &args) {
   logrus::flush_every(std::chrono::seconds(1));
 }
 
+static long get_cpu_count() { return sysconf(_SC_NPROCESSORS_CONF); }
+
 int main(int argc, char *argv[]) {
   CommandArgs args;
-  must_parse_command_line(argc, argv, args);
+  try {
+    must_parse_command_line(argc, argv, args);
+  } catch (const std::exception &e) {
+    LOG_FATAL("Fatal parse command line", KV("error", e.what()));
+  }
 
   init_logging(args);
   LOG_INFO("=== mux start ===");
 
-  for (const RelayIPAddrTuple &t : args.addr_tuple_list) {
-    LOG_INFO("Listen on", KV("addr", t.listen.format()),
-             KV("src", t.src.format()), KV("dst", t.dst.format()));
-
-    int sockfd = create_and_bind_listener(t.listen, true);
-    if (sockfd < 0)
-      LOG_FATAL("Fatal to listen", KERR(errno), KV("addr", t.listen.format()));
-
-    attach_listener(ev_default_loop(), sockfd, t);
+  try {
+    EventLoopPool p = create_event_loop_pool(get_cpu_count());
+    for (const RelayIPAddrTuple &t : args.addr_tuple_list) {
+      LOG_INFO("Listen on", KV("addr", t.listen.format()),
+               KV("src", t.src.format()), KV("dst", t.dst.format()));
+      int sockfd = create_and_bind_listener(t.listen, true);
+      attach_listener(p, sockfd, t);
+    }
+    run_event_loop_pool(p);
+  } catch (const std::exception &e) {
+    LOG_FATAL("Fatal to run mux", KV("error", e.what()));
   }
-  ev_loop(ev_default_loop(), 0);
 
   LOG_INFO("=== mux quit ===");
   return 0;
