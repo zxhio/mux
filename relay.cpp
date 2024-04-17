@@ -22,73 +22,70 @@ Relay::Relay(tcp::socket client_conn, tcp::socket server_conn,
              const tcp::endpoint &client_raddr,
              const tcp::endpoint &server_laddr,
              const tcp::endpoint &server_raddr)
-    : client_conn_(std::move(client_conn)),
-      server_conn_(std::move(server_conn)) {
+    : client_(std::move(client_conn), client_laddr, client_raddr),
+      server_(std::move(server_conn), server_laddr, server_raddr) {
   LOG_INFO("Forward", KV("from", to_string(client_raddr)),
            KV("via", to_string(client_laddr)),
            KV("to", to_string(server_raddr)));
 }
 
 Relay::~Relay() {
-  std::error_code ec;
-  client_conn_.remote_endpoint(ec);
-  LOG_INFO("Forward done",
-           KV("from", to_string(client_conn_.remote_endpoint(ec))),
-           KV("via", to_string(client_conn_.local_endpoint(ec))),
-           KV("to", to_string(server_conn_.remote_endpoint(ec))));
+  LOG_INFO("Forward done", KV("from", to_string(client_.raddr_)),
+           KV("via", to_string(client_.laddr_)),
+           KV("to", to_string(server_.raddr_)),
+           KV("in_bytes", client_.read_count_),
+           KV("out_bytes", client_.write_count_));
 }
 
 void Relay::start() noexcept {
   auto client_buf = std::make_shared<std::vector<char>>(1024 * 32);
   auto server_buf = std::make_shared<std::vector<char>>(1024 * 32);
-  io_copy(client_conn_, server_conn_, client_buf);
-  io_copy(server_conn_, client_conn_, server_buf);
+  io_copy(client_, server_, client_buf);
+  io_copy(server_, client_, server_buf);
 }
 
-void Relay::io_copy(tcp::socket &from, tcp::socket &to,
-                    SharedBuffer buf) noexcept {
+void Relay::io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf) noexcept {
   auto self = shared_from_this();
-  from.async_read_some(
+  from.conn_.async_read_some(
       asio::buffer(*buf, buf->capacity()),
       [this, self, &from, &to, buf](asio::error_code ec, size_t nread) {
         if (ec) {
           if (ec == asio::error::eof) {
-            LOG_DEBUG("Closed by",
-                      KV("laddr", to_string(from.local_endpoint(ec))),
-                      KV("remote", to_string(from.remote_endpoint(ec))));
-            from.shutdown(asio::socket_base::shutdown_receive, ec);
-            to.shutdown(asio::socket_base::shutdown_send, ec);
+            LOG_DEBUG("Closed by", KV("laddr", to_string(from.laddr_)),
+                      KV("remote", to_string(from.raddr_)));
+            from.conn_.shutdown(asio::socket_base::shutdown_receive, ec);
+            to.conn_.shutdown(asio::socket_base::shutdown_send, ec);
           } else {
             LOG_DEBUG("Fail to read from", KV("error", ec.message()),
-                      KV("remote", to_string(from.remote_endpoint(ec))),
-                      KV("laddr", to_string(from.local_endpoint(ec))));
+                      KV("remote", to_string(from.raddr_)),
+                      KV("laddr", to_string(from.laddr_)));
           }
           return;
         }
-        LOG_TRACE("Read from", KV("raddr", to_string(from.remote_endpoint(ec))),
-                  KV("laddr", to_string(from.local_endpoint(ec))),
-                  KV("n", nread), KV("buf", buf->size()));
+        LOG_TRACE("Read from", KV("raddr", to_string(from.raddr_)),
+                  KV("laddr", to_string(from.laddr_)), KV("n", nread));
+        from.read_count_ += nread;
         async_write_all(self, from, to, buf, nread);
       });
 }
 
-void Relay::async_write_all(std::shared_ptr<Relay> self, tcp::socket &from,
-                            tcp::socket &to, SharedBuffer buf,
+void Relay::async_write_all(std::shared_ptr<Relay> self, RelayConn &from,
+                            RelayConn &to, SharedBuffer buf,
                             size_t n) noexcept {
   asio::async_write(
-      to, asio::buffer(*buf, n),
+      to.conn_, asio::buffer(*buf, n),
       [this, self, &from, &to, buf, n](std::error_code ec, size_t nwrite) {
         if (ec) {
           LOG_ERROR("Fail to write", KV("error", ec.message()),
-                    KV("laddr", to_string(to.local_endpoint(ec))),
-                    KV("raddr", to_string(to.remote_endpoint(ec))));
-          from.close(ec);
-          to.close(ec);
+                    KV("laddr", to_string(to.laddr_)),
+                    KV("raddr", to_string(to.raddr_)));
+          from.conn_.close(ec);
+          to.conn_.close(ec);
           return;
         }
-        LOG_TRACE("Write to", KV("laddr", to_string(to.local_endpoint(ec))),
-                  KV("raddr", to_string(to.remote_endpoint(ec))),
-                  KV("n", nwrite), KV("buf", n));
+        LOG_TRACE("Write to", KV("laddr", to_string(to.laddr_)),
+                  KV("raddr", to_string(to.raddr_)), KV("n", nwrite));
+        to.write_count_ += nwrite;
         if (nwrite < n) {
           buf->erase(buf->begin(), buf->begin() + nwrite);
           async_write_all(self, from, to, buf, n - nwrite);
@@ -107,11 +104,18 @@ RelayServer::RelayServer(asio::io_context &context,
 void RelayServer::new_conn(tcp::socket client_conn) noexcept {
   std::error_code ec;
   tcp::endpoint client_laddr = client_conn.local_endpoint(ec);
-  if (ec)
+  if (ec) {
+    LOG_INFO("Fail to get client local addr", KV("err", ec.message()),
+             KV("fd", client_conn.native_handle()));
     return;
+  }
   tcp::endpoint client_raddr = client_conn.remote_endpoint(ec);
-  if (ec)
+  if (ec) {
+    LOG_INFO("Fail to get client remote addr", KV("err", ec.message()),
+             KV("laddr", to_string(client_laddr)),
+             KV("fd", client_conn.native_handle()));
     return;
+  }
 
   LOG_INFO("New conn", KV("laddr", to_string(client_laddr)),
            KV("raddr", to_string(client_raddr)));
@@ -120,7 +124,8 @@ void RelayServer::new_conn(tcp::socket client_conn) noexcept {
   if (endpoints_.src.port() > 0 || !endpoints_.src.address().is_unspecified()) {
     server_conn.bind(endpoints_.src, ec);
     if (ec) {
-      LOG_ERROR("Fail to bind", KV("src", to_string(endpoints_.src)));
+      LOG_ERROR("Fail to bind", KV("err", ec.message()),
+                KV("src", to_string(endpoints_.src)));
       return;
     }
   }
@@ -133,8 +138,12 @@ void RelayServer::new_conn(tcp::socket client_conn) noexcept {
     return;
   }
   tcp::endpoint server_laddr = server_conn.local_endpoint(ec);
-  if (ec)
+  if (ec) {
+    LOG_ERROR("Fail to get server local addr", KV("err", ec.message()),
+              KV("fd", server_conn.native_handle()),
+              KV("client_raddr", to_string(client_raddr)));
     return;
+  }
 
   LOG_DEBUG("Connected to", KV("laddr", to_string(server_laddr)),
             KV("raddr", to_string(endpoints_.dst)));

@@ -17,7 +17,20 @@ struct RelayEndpoints {
   asio::ip::tcp::endpoint dst;
 };
 
-struct Relay : public std::enable_shared_from_this<Relay> {
+struct RelayConn {
+  asio::ip::tcp::socket conn_;
+  asio::ip::tcp::endpoint laddr_;
+  asio::ip::tcp::endpoint raddr_;
+  uint64_t read_count_;
+  uint64_t write_count_;
+
+  RelayConn(asio::ip::tcp::socket conn, const asio::ip::tcp::endpoint &laddr,
+            const asio::ip::tcp::endpoint &raddr)
+      : conn_(std::move(conn)), laddr_(laddr), raddr_(raddr), read_count_(0),
+        write_count_(0) {}
+};
+
+class Relay : public std::enable_shared_from_this<Relay> {
 public:
   using SharedBuffer = std::shared_ptr<std::vector<char>>;
 
@@ -32,20 +45,13 @@ public:
   void start() noexcept;
 
 private:
-  void async_write_all(std::shared_ptr<Relay> self, asio::ip::tcp::socket &from,
-                       asio::ip::tcp::socket &to, SharedBuffer buf,
-                       size_t n) noexcept;
+  void async_write_all(std::shared_ptr<Relay> self, RelayConn &from,
+                       RelayConn &to, SharedBuffer buf, size_t n) noexcept;
 
-  void io_copy(asio::ip::tcp::socket &from, asio::ip::tcp::socket &to,
-               SharedBuffer buf) noexcept;
+  void io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf) noexcept;
 
-  // TODO: Cache addr to avoid call getsockname/getpeername
-  // asio::ip::tcp::endpoint client_laddr_;
-  // asio::ip::tcp::endpoint client_raddr_;
-  // asio::ip::tcp::endpoint server_laddr_;
-  // asio::ip::tcp::endpoint server_raddr_;
-  asio::ip::tcp::socket client_conn_;
-  asio::ip::tcp::socket server_conn_;
+  RelayConn client_;
+  RelayConn server_;
 };
 
 class RelayServer {
