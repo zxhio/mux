@@ -73,7 +73,11 @@ void Logger::set_pattern(const std::string &pattern) {
 }
 
 void Logger::set_level(Level level) {
-  impl_->logger_->set_level((spdlog::level::level_enum)level);
+  impl_->logger_->set_level(static_cast<spdlog::level::level_enum>(level));
+}
+
+Level Logger::get_level() const {
+  return static_cast<Level>(impl_->logger_->level());
 }
 
 void Logger::set_rotating(const std::string &lname, const std::string &fname,

@@ -148,7 +148,10 @@ public:
   Logger &operator=(const Logger &) = delete;
 
   void set_pattern(const std::string &pattern);
+
+  Level get_level() const;
   void set_level(Level level);
+
   void set_rotating(const std::string &lname, const std::string &fname,
                     size_t max_file_size, size_t max_files);
 
@@ -218,6 +221,8 @@ inline void set_pattern(const std::string &pattern) {
 
 inline void set_level(Level level) { sl().set_level(level); }
 
+inline Level get_level() { return sl().get_level(); }
+
 inline void set_rotating(const std::string &fname, size_t max_file_size,
                          size_t max_files) {
   sl().set_rotating("default", fname, max_file_size, max_files);
@@ -276,24 +281,30 @@ LOGRUS_DECLARE_LOG(fatal);
 #define KERR(errnum) KV(logrus::kFieldErrKey, strerror(errnum))
 
 #ifdef LOGRUS_WITH_LOC
-#define LOG_(logger, logfunc, msg, ...)                                        \
-  logger.with_fields({__VA_ARGS__})                                            \
-      .logfunc(__FILE__, __LINE__, __FUNCTION__, msg)
+#define LOG_(logger, level, logfunc, msg, ...)                                 \
+  do {                                                                         \
+    if (logger.get_level() <= level)                                           \
+      logger.with_fields({__VA_ARGS__})                                        \
+          .logfunc(__FILE__, __LINE__, __FUNCTION__, msg);                     \
+  } while (0)
 #else
-#define LOG_(logger, logfunc, msg, ...)                                        \
-  logger.with_fields({__VA_ARGS__}).logfunc(msg)
+#define LOG_(logger, level, logfunc, msg, ...)                                 \
+  do {                                                                         \
+    if (logger.get_level() <= level)                                           \
+      logger.with_fields({__VA_ARGS__}).logfunc(msg);                          \
+  } while (0)
 #endif
 
-#define LOG_TRACE(msg, ...) LOG_(logrus::sl(), trace, msg, __VA_ARGS__)
-#define LOG_DEBUG(msg, ...) LOG_(logrus::sl(), debug, msg, __VA_ARGS__)
-#define LOG_INFO(msg, ...) LOG_(logrus::sl(), info, msg, __VA_ARGS__)
-#define LOG_WARN(msg, ...) LOG_(logrus::sl(), warn, msg, __VA_ARGS__)
-#define LOG_ERROR(msg, ...) LOG_(logrus::sl(), error, msg, __VA_ARGS__)
-#define LOG_FATAL(msg, ...) LOG_(logrus::sl(), fatal, msg, __VA_ARGS__)
+#define LOG_TRACE_(l, msg, ...) LOG_(l, logrus::kTrace, trace, msg, __VA_ARGS__)
+#define LOG_DEBUG_(l, msg, ...) LOG_(l, logrus::kDebug, debug, msg, __VA_ARGS__)
+#define LOG_INFO_(l, msg, ...) LOG_(l, logrus::kInfo, info, msg, __VA_ARGS__)
+#define LOG_WARN_(l, msg, ...) LOG_(l, logrus::kWarn, warn, msg, __VA_ARGS__)
+#define LOG_ERROR_(l, msg, ...) LOG_(l, logrus::kError, error, msg, __VA_ARGS__)
+#define LOG_FATAL_(l, msg, ...) LOG_(l, logrus::kFatal, fatal, msg, __VA_ARGS__)
 
-#define LOG_TRACE_(l, msg, ...) LOG_(l, trace, msg, __VA_ARGS__)
-#define LOG_DEBUG_(l, msg, ...) LOG_(l, debug, msg, __VA_ARGS__)
-#define LOG_INFO_(l, msg, ...) LOG_(l, info, msg, __VA_ARGS__)
-#define LOG_WARN_(l, msg, ...) LOG_(l, warn, msg, __VA_ARGS__)
-#define LOG_ERROR_(l, msg, ...) LOG_(l, error, msg, __VA_ARGS__)
-#define LOG_FATAL_(l, msg, ...) LOG_(l, fatal, msg, __VA_ARGS__)
+#define LOG_TRACE(msg, ...) LOG_TRACE_(logrus::sl(), msg, __VA_ARGS__)
+#define LOG_DEBUG(msg, ...) LOG_DEBUG_(logrus::sl(), msg, __VA_ARGS__)
+#define LOG_INFO(msg, ...) LOG_INFO_(logrus::sl(), msg, __VA_ARGS__)
+#define LOG_WARN(msg, ...) LOG_WARN_(logrus::sl(), msg, __VA_ARGS__)
+#define LOG_ERROR(msg, ...) LOG_ERROR_(logrus::sl(), msg, __VA_ARGS__)
+#define LOG_FATAL(msg, ...) LOG_FATAL_(logrus::sl(), msg, __VA_ARGS__)
