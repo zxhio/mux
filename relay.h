@@ -9,42 +9,53 @@
 
 #pragma once
 
-#include "addr.h"
+#include <asio/ip/tcp.hpp>
 
-#include <map>
-#include <memory>
-#include <vector>
-
-#include <ev.h>
-
-struct RelayIPAddrTuple {
-  IPAddr listen; // listen address
-  IPAddr dst;    // server address
-  IPAddr src;    // source address for connect
+struct RelayEndpoints {
+  asio::ip::tcp::endpoint listen;
+  asio::ip::tcp::endpoint src;
+  asio::ip::tcp::endpoint dst;
 };
 
-struct EventLoopPool;
+struct Relay : public std::enable_shared_from_this<Relay> {
+public:
+  using SharedBuffer = std::shared_ptr<std::vector<char>>;
 
-struct EventLoop {
-  size_t id_;
-  EventLoopPool *pool_;
-  struct ev_loop *loop_;
-  struct ev_io efd_io_;
-  std::map<int, RelayIPAddrTuple> relay_addrs_; // relay addresses
-  std::vector<char> buf_;                       // reuse buf for read
+  Relay(asio::ip::tcp::socket client_conn, asio::ip::tcp::socket server_conn,
+        const asio::ip::tcp::endpoint &client_laddr,
+        const asio::ip::tcp::endpoint &client_raddr,
+        const asio::ip::tcp::endpoint &server_laddr,
+        const asio::ip::tcp::endpoint &server_raddr);
 
-  EventLoop(size_t id, EventLoopPool *pool, int efd);
+  ~Relay();
+
+  void start() noexcept;
+
+private:
+  void async_write_all(std::shared_ptr<Relay> self, asio::ip::tcp::socket &from,
+                       asio::ip::tcp::socket &to, SharedBuffer buf,
+                       size_t n) noexcept;
+
+  void io_copy(asio::ip::tcp::socket &from, asio::ip::tcp::socket &to,
+               SharedBuffer buf) noexcept;
+
+  // TODO: Cache addr to avoid call getsockname/getpeername
+  // asio::ip::tcp::endpoint client_laddr_;
+  // asio::ip::tcp::endpoint client_raddr_;
+  // asio::ip::tcp::endpoint server_laddr_;
+  // asio::ip::tcp::endpoint server_raddr_;
+  asio::ip::tcp::socket client_conn_;
+  asio::ip::tcp::socket server_conn_;
 };
 
-struct EventLoopPool {
-  std::vector<std::unique_ptr<EventLoop>> loops;
-  std::map<int, struct ev_io> watchers; // listener watchers
-  size_t curr_loop_idx;
+class RelayServer {
+public:
+  RelayServer(asio::io_context &context, const RelayEndpoints &endpoints);
+
+private:
+  void new_conn(asio::ip::tcp::socket client_conn) noexcept;
+  void do_accept();
+
+  RelayEndpoints endpoints_;
+  asio::ip::tcp::acceptor acceptor_;
 };
-
-void attach_listener(EventLoopPool &p, int listenfd,
-                     const RelayIPAddrTuple &addr_tuple);
-
-EventLoopPool create_event_loop_pool(size_t n);
-
-void run_event_loop_pool(EventLoopPool &p);

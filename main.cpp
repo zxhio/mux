@@ -7,7 +7,7 @@
 // Date:    2024/04/09 22:24:02
 //===----------------------------------------------------------------------===//
 
-#include "conn.h"
+#include "errors.h"
 #include "logrus.h"
 #include "netutil.h"
 #include "relay.h"
@@ -16,6 +16,11 @@
 #include <stdio.h>
 
 #include <sstream>
+#include <thread>
+
+#include <asio.hpp>
+
+using namespace asio::ip;
 
 static struct option opts[] = {
     {"listen", required_argument, NULL, 'l'},
@@ -42,35 +47,31 @@ static void usage(char *argv1) {
 }
 
 struct CommandArgs {
-  std::vector<RelayIPAddrTuple> addr_tuple_list;
+  std::vector<RelayEndpoints> addr_tuple_list;
   std::string logfile;
   bool verbose;
 };
 
-static IPAddr must_parse_addr(const std::string &addr_text) {
-  std::string::size_type n = addr_text.find_last_of(':');
-  if (n == std::string::npos) {
-    // Only ip
-    if (!std::all_of(addr_text.begin(), addr_text.end(),
-                     [](char c) { return std::isdigit(c); }))
-      return parse_iptext_port(addr_text, 0);
-
-    // Only port
-    int port = std::stoi(addr_text);
-    if (port >= 0 && port <= 65536) {
-      return parse_iptext_port("0.0.0.0", uint16_t(port));
-    } else {
-      return IPAddr();
-    }
+static tcp::endpoint parse_addr(const std::string &hostport) {
+  if (std::all_of(hostport.begin(), hostport.end(),
+                  [](char c) { return std::isdigit(c); })) {
+    int port = std::stoi(hostport);
+    if (port < 0 || port > 65535)
+      throw std::system_error(
+          std::error_code(AddrErrInvalidPort, address_category()), hostport);
+    return tcp::endpoint(tcp::v4(), port);
   }
 
-  std::string ip_part = addr_text.substr(0, n);
-  std::string port_part = addr_text.substr(n + 1);
-  int port = std::stoi(port_part);
-  if (port < 0) {
-    return IPAddr();
-  }
-  return parse_iptext_port(ip_part, uint16_t(port));
+  std::error_code ec;
+  std::pair<std::string, std::string> p = split_host_port(hostport, ec);
+  if (ec)
+    throw std::system_error(ec, hostport);
+
+  int port = std::stoi(p.second);
+  if (port < 0 || port > 65535)
+    throw std::system_error(
+        std::error_code(AddrErrInvalidPort, address_category()), hostport);
+  return tcp::endpoint(address::from_string(p.first), std::stoi(p.second));
 }
 
 std::vector<std::string> split(const std::string &s, char delim) {
@@ -83,22 +84,22 @@ std::vector<std::string> split(const std::string &s, char delim) {
 }
 
 // listen_addr,src_addr,dst_addr/
-// 80,192.168.32.210:8000,192.168.32.251:8000/192.168.32.245:80,192.168.32.251:8000;
-static std::vector<RelayIPAddrTuple> must_parse_addr_tuple(const char *s) {
-  std::vector<RelayIPAddrTuple> addr_tuple_list;
+// 80,192.168.32.210:8000,192.168.32.251:8000/192.168.32.245:80,192.168.32.251:8000
+static std::vector<RelayEndpoints> parse_addr_tuple(const char *s) {
+  std::vector<RelayEndpoints> addr_tuple_list;
   std::vector<std::string> tuple_str_list = split(s, '/');
   for (const auto &tuple_str : tuple_str_list) {
     std::vector<std::string> addr_str_list = split(tuple_str, ',');
     if (addr_str_list.size() < 2)
       throw std::logic_error("tuple address count must > 2");
 
-    RelayIPAddrTuple t;
-    t.listen = must_parse_addr(addr_str_list[0]);
+    RelayEndpoints t;
+    t.listen = parse_addr(addr_str_list[0]);
     if (addr_str_list.size() == 2) {
-      t.dst = must_parse_addr(addr_str_list[1]);
+      t.dst = parse_addr(addr_str_list[1]);
     } else {
-      t.src = must_parse_addr(addr_str_list[1]);
-      t.dst = must_parse_addr(addr_str_list[2]);
+      t.src = parse_addr(addr_str_list[1]);
+      t.dst = parse_addr(addr_str_list[2]);
     }
     addr_tuple_list.push_back(t);
   }
@@ -106,21 +107,18 @@ static std::vector<RelayIPAddrTuple> must_parse_addr_tuple(const char *s) {
 }
 
 static void
-check_addr_tuple_valid(const std::vector<RelayIPAddrTuple> &addr_tuple_list) {
+check_addr_tuple_valid(const std::vector<RelayEndpoints> &addr_tuple_list) {
   for (const auto &t : addr_tuple_list) {
+    std::string dst_desc = "dst_addr (" + to_string(t.dst) + ")";
     if (t.dst.port() == 0)
-      throw t.dst.format() + "dst_addr port can't be 0";
-
-    std::string addr_text = t.dst.format();
-    if (addr_text.find("0.0.0.0") != std::string::npos)
-      throw std::logic_error(t.dst.format() + " dst_addr ip can't be 0.0.0.0");
-    else if (addr_text.find("[::]") != std::string::npos)
-      throw std::logic_error(t.dst.format() + " dst_addr ip can't be [::]");
+      throw std::logic_error(dst_desc + " port can't be 0");
+    if (t.dst.address().is_unspecified())
+      throw std::logic_error(dst_desc + " ip must be specified");
   }
 }
 
-static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
-  RelayIPAddrTuple addr_tuple;
+static void parse_command_line(int argc, char *argv[], CommandArgs &args) {
+  RelayEndpoints addr_tuple;
   while (1) {
     int longidnd;
     int c = getopt_long(argc, argv, "l:d:s:r:f:Vh", opts, &longidnd);
@@ -130,19 +128,19 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
 
     switch (c) {
     case 'l':
-      addr_tuple.listen = must_parse_addr(arg);
+      addr_tuple.listen = parse_addr(arg);
       break;
     case 'd':
-      addr_tuple.dst = must_parse_addr(arg);
+      addr_tuple.dst = parse_addr(arg);
       break;
     case 's':
-      addr_tuple.src = must_parse_addr(arg);
+      addr_tuple.src = parse_addr(arg);
       break;
     case 'f':
       args.logfile = arg;
       break;
     case 'r':
-      args.addr_tuple_list = must_parse_addr_tuple(arg);
+      args.addr_tuple_list = parse_addr_tuple(arg);
       break;
     case 'V':
       args.verbose = true;
@@ -156,9 +154,7 @@ static void must_parse_command_line(int argc, char *argv[], CommandArgs &args) {
     }
   }
 
-  // address tuple must contains listen_addr and dst_addr
-  if (addr_tuple.listen.addr()->sa_family != AF_UNSPEC &&
-      addr_tuple.dst.addr()->sa_family != AF_UNSPEC)
+  if (addr_tuple.listen.port() > 0 && addr_tuple.dst.port() > 0)
     args.addr_tuple_list.push_back(addr_tuple);
 
   check_addr_tuple_valid(args.addr_tuple_list);
@@ -178,7 +174,7 @@ static long get_cpu_count() { return sysconf(_SC_NPROCESSORS_CONF); }
 int main(int argc, char *argv[]) {
   CommandArgs args;
   try {
-    must_parse_command_line(argc, argv, args);
+    parse_command_line(argc, argv, args);
   } catch (const std::exception &e) {
     LOG_FATAL("Fatal parse command line", KV("error", e.what()));
   }
@@ -187,14 +183,15 @@ int main(int argc, char *argv[]) {
   LOG_INFO("=== mux start ===");
 
   try {
-    EventLoopPool p = create_event_loop_pool(get_cpu_count());
-    for (const RelayIPAddrTuple &t : args.addr_tuple_list) {
-      LOG_INFO("Listen on", KV("addr", t.listen.format()),
-               KV("src", t.src.format()), KV("dst", t.dst.format()));
-      int sockfd = create_and_bind_listener(t.listen, true);
-      attach_listener(p, sockfd, t);
+    asio::io_context io_context;
+    std::vector<std::unique_ptr<RelayServer>> server_list;
+
+    for (const RelayEndpoints &t : args.addr_tuple_list) {
+      LOG_INFO("Listen on", KV("addr", to_string(t.listen)),
+               KV("src", to_string(t.src)), KV("dst", to_string(t.dst)));
+      server_list.emplace_back(std::make_unique<RelayServer>(io_context, t));
     }
-    run_event_loop_pool(p);
+    io_context.run();
   } catch (const std::exception &e) {
     LOG_FATAL("Fatal to run mux", KV("error", e.what()));
   }

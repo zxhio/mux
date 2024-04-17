@@ -9,22 +9,10 @@
 
 #pragma once
 
-#include "addr.h"
-
-#include <fcntl.h>
-#include <unistd.h>
-
+#include <asio/ip/tcp.hpp>
 #include <system_error>
 
-// Set fd to nonblocking mode.
-int set_nonblocking(int fd);
+std::string to_string(const asio::ip::tcp::endpoint &endpoint);
 
-// Create a listener socket and bind it.
-int create_and_bind_listener(const IPAddr &addr, bool nonblock,
-                             std::error_code &ec) noexcept;
-int create_and_bind_listener(const IPAddr &addr, bool nonblock);
-
-// Create a connection socket.
-int create_connection(const IPAddr &saddr, const IPAddr &daddr,
-                      std::error_code &ec) noexcept;
-int create_connection(const IPAddr &saddr, const IPAddr &daddr);
+std::pair<std::string, std::string> split_host_port(const std::string &hostport,
+                                                    std::error_code &ec);
