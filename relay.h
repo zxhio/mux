@@ -45,9 +45,6 @@ public:
   void start() noexcept;
 
 private:
-  void async_write_all(std::shared_ptr<Relay> self, RelayConn &from,
-                       RelayConn &to, SharedBuffer buf, size_t n) noexcept;
-
   void io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf) noexcept;
 
   RelayConn client_;

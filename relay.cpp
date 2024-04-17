@@ -65,33 +65,24 @@ void Relay::io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf) noexcept {
         LOG_TRACE("Read from", KV("raddr", to_string(from.raddr_)),
                   KV("laddr", to_string(from.laddr_)), KV("n", nread));
         from.read_count_ += nread;
-        async_write_all(self, from, to, buf, nread);
-      });
-}
 
-void Relay::async_write_all(std::shared_ptr<Relay> self, RelayConn &from,
-                            RelayConn &to, SharedBuffer buf,
-                            size_t n) noexcept {
-  asio::async_write(
-      to.conn_, asio::buffer(*buf, n),
-      [this, self, &from, &to, buf, n](std::error_code ec, size_t nwrite) {
-        if (ec) {
-          LOG_ERROR("Fail to write", KV("error", ec.message()),
-                    KV("laddr", to_string(to.laddr_)),
-                    KV("raddr", to_string(to.raddr_)));
-          from.conn_.close(ec);
-          to.conn_.close(ec);
-          return;
-        }
-        LOG_TRACE("Write to", KV("laddr", to_string(to.laddr_)),
-                  KV("raddr", to_string(to.raddr_)), KV("n", nwrite));
-        to.write_count_ += nwrite;
-        if (nwrite < n) {
-          buf->erase(buf->begin(), buf->begin() + nwrite);
-          async_write_all(self, from, to, buf, n - nwrite);
-        } else {
-          io_copy(from, to, buf);
-        }
+        asio::async_write(
+            to.conn_, asio::buffer(*buf, nread),
+            [this, self, &from, &to, buf, nread](std::error_code ec,
+                                                 size_t nwrite) {
+              if (ec) {
+                LOG_ERROR("Fail to write", KV("error", ec.message()),
+                          KV("laddr", to_string(to.laddr_)),
+                          KV("raddr", to_string(to.raddr_)));
+                from.conn_.close(ec);
+                to.conn_.close(ec);
+                return;
+              }
+              LOG_TRACE("Write to", KV("laddr", to_string(to.laddr_)),
+                        KV("raddr", to_string(to.raddr_)), KV("n", nwrite));
+              to.write_count_ += nwrite;
+              io_copy(from, to, buf);
+            });
       });
 }
 
