@@ -125,14 +125,73 @@ void Relay::write_all(RelayConn &from, RelayConn &to, SharedBuffer buf,
       });
 }
 
-RelayServer::RelayServer(asio::io_context &context,
-                         const RelayEndpoints &endpoints)
-    : endpoints_(endpoints), acceptor_(context, endpoints.listen) {
-  do_accept();
+static int create_eventfd(std::error_code &ec) noexcept {
+  int efd = eventfd(0, O_NONBLOCK);
+  if (efd < 0) {
+    ec = std::error_code(errno, std::system_category());
+    return -1;
+  }
+  return efd;
 }
 
-void RelayServer::new_conn(tcp::socket client_conn) noexcept {
+static int create_eventfd() {
   std::error_code ec;
+  int efd = create_eventfd(ec);
+  asio::detail::throw_error(ec);
+  return efd;
+}
+
+RelayIOContext::RelayIOContext(
+    size_t id, const std::vector<RelayEndpointTuple> &endpoint_tuples)
+    : id_(id), context_(), eventfd_stream_(context_, create_eventfd()),
+      endpoint_tuples_(endpoint_tuples) {
+  wait_eventfd();
+}
+
+void RelayIOContext::notify(int connfd, uint16_t endpoint_idx) {
+  eventfd_stream_.async_wait(
+      asio::posix::stream_descriptor::wait_write, [this](std::error_code ec) {
+        if (ec) {
+          LOG_ERROR("Fail to async_wait", KV("error", ec.message()));
+          return;
+        }
+
+        LOG_DEBUG("Notify io_context", KV("id", id_));
+        if (::eventfd_write(eventfd_stream_.native_handle(), 1) < 0)
+          LOG_ERROR("Fail to write eventfd", KERR(errno));
+      });
+
+  new_conn(connfd, endpoint_tuples_[endpoint_idx]);
+}
+
+void RelayIOContext::wait_eventfd() noexcept {
+  eventfd_stream_.async_wait(
+      asio::posix::stream_descriptor::wait_read, [this](std::error_code ec) {
+        if (ec) {
+          LOG_ERROR("Fail to async_wait eventfd", KV("error", ec.message()));
+          return;
+        }
+
+        uint64_t v;
+        ::eventfd_read(eventfd_stream_.native_handle(), &v);
+
+        wait_eventfd();
+      });
+}
+
+void RelayIOContext::new_conn(
+    int connfd, const RelayEndpointTuple &endpoint_tuple) noexcept {
+  std::error_code ec;
+  tcp::socket client_conn(context_);
+  client_conn.assign(endpoint_tuple.listen.protocol(), connfd, ec);
+  if (ec) {
+    LOG_ERROR("Fail to make tcp socket", KV("error", ec.message()),
+              KV("fd", connfd), KV("efd", eventfd_stream_.native_handle()),
+              KV("id", id_));
+    ::close(connfd);
+    return;
+  }
+
   tcp::endpoint client_laddr = client_conn.local_endpoint(ec);
   if (ec) {
     LOG_INFO("Fail to get client local addr", KV("err", ec.message()),
@@ -146,25 +205,26 @@ void RelayServer::new_conn(tcp::socket client_conn) noexcept {
              KV("fd", client_conn.native_handle()));
     return;
   }
-
   LOG_INFO("New conn", KV("laddr", to_string(client_laddr)),
-           KV("raddr", to_string(client_raddr)));
+           KV("raddr", to_string(client_raddr)), KV("fd", connfd));
 
-  tcp::socket server_conn(acceptor_.get_executor());
-  if (endpoints_.src.port() > 0 || !endpoints_.src.address().is_unspecified()) {
-    server_conn.bind(endpoints_.src, ec);
+  // RelayEndpointTuple endpoint_tuple = endpoint_tuples_[endpoint_idx];
+  tcp::socket server_conn(context_);
+  if (endpoint_tuple.src.port() > 0 ||
+      !endpoint_tuple.src.address().is_unspecified()) {
+    server_conn.bind(endpoint_tuple.src, ec);
     if (ec) {
       LOG_ERROR("Fail to bind", KV("err", ec.message()),
-                KV("src", to_string(endpoints_.src)));
+                KV("src", to_string(endpoint_tuple.src)));
       return;
     }
   }
 
-  server_conn.connect(endpoints_.dst, ec);
+  server_conn.connect(endpoint_tuple.dst, ec);
   if (ec) {
     LOG_ERROR("Fail to connect", KV("error", ec.message()),
-              KV("src", to_string(endpoints_.src)),
-              KV("dst", to_string(endpoints_.dst)));
+              KV("src", to_string(endpoint_tuple.src)),
+              KV("dst", to_string(endpoint_tuple.dst)));
     return;
   }
   tcp::endpoint server_laddr = server_conn.local_endpoint(ec);
@@ -176,22 +236,56 @@ void RelayServer::new_conn(tcp::socket client_conn) noexcept {
   }
 
   LOG_DEBUG("Connected to", KV("laddr", to_string(server_laddr)),
-            KV("raddr", to_string(endpoints_.dst)));
+            KV("raddr", to_string(endpoint_tuple.dst)));
   std::make_shared<Relay>(std::move(client_conn), std::move(server_conn),
                           client_laddr, client_raddr, server_laddr,
-                          endpoints_.dst)
+                          endpoint_tuple.dst)
       ->start();
 }
 
-void RelayServer::do_accept() {
-  acceptor_.async_accept([this](std::error_code ec, tcp::socket socket) {
-    if (!ec) {
-      new_conn(std::move(socket));
-    } else {
-      LOG_ERROR("Fail to accept", KV("error", ec.message()),
-                KV("fd", acceptor_.native_handle()));
-      return;
-    }
-    do_accept();
-  });
+RelayServer::RelayServer(std::vector<RelayEndpointTuple> endpoint_tuples)
+    : endpoint_tuples_(endpoint_tuples), relay_context_idx_(0) {}
+
+void RelayServer::run(size_t co_num) {
+  co_num = std::max(co_num, size_t(1));
+  LOG_INFO("Relay Server run", KV("co_num", co_num));
+
+  for (size_t i = 0; i < co_num; i++)
+    relay_contexts_.emplace_back(
+        std::make_shared<RelayIOContext>(i, endpoint_tuples_));
+
+  for (size_t i = 0; i < endpoint_tuples_.size(); i++) {
+    auto et = endpoint_tuples_[i];
+    LOG_INFO("Listen on", KV("addr", to_string(et.listen)),
+             KV("via", to_string(et.src)), KV("to", to_string(et.dst)));
+    auto a =
+        std::make_shared<Acceptor>(relay_contexts_[0]->context(), i, et.listen);
+    do_accept(*a);
+    acceptors_.emplace_back(a);
+  }
+
+  std::vector<std::thread> threads;
+  for (int i = 1; i < relay_contexts_.size(); i++)
+    threads.emplace_back(
+        std::thread([i, this]() { relay_contexts_[i]->run(); }));
+  relay_contexts_[0]->run();
+}
+
+void RelayServer::do_accept(Acceptor &ra) noexcept {
+  ra.acceptor_.async_wait(
+      asio::socket_base::wait_read, [this, &ra](std::error_code ec) {
+        int connfd = ::accept(ra.acceptor_.native_handle(), nullptr, nullptr);
+        if (connfd < 0) {
+          LOG_ERROR("Fail to accept", KERR(errno));
+          return;
+        }
+
+        relay_context_idx_++;
+        if (relay_context_idx_ % relay_contexts_.size() == 0)
+          relay_context_idx_++;
+        auto ctx = relay_contexts_[relay_context_idx_ % relay_contexts_.size()];
+        ctx->notify(connfd, ra.endpoint_idx_);
+
+        do_accept(ra);
+      });
 }

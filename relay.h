@@ -9,10 +9,11 @@
 
 #pragma once
 
+#include <asio.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/streambuf.hpp>
 
-struct RelayEndpoints {
+struct RelayEndpointTuple {
   asio::ip::tcp::endpoint listen;
   asio::ip::tcp::endpoint src;
   asio::ip::tcp::endpoint dst;
@@ -59,14 +60,50 @@ private:
   TimePoint start_;
 };
 
-class RelayServer {
+class RelayIOContext : private asio::noncopyable {
 public:
-  RelayServer(asio::io_context &context, const RelayEndpoints &endpoints);
+  RelayIOContext() = delete;
+  RelayIOContext(size_t id,
+                 const std::vector<RelayEndpointTuple> &endpoint_tuples);
+
+  void run() { context_.run(); }
+  void run(std::error_code &ec) { context_.run(ec); }
+
+  void notify(int fd, uint16_t endpoint_idx);
+
+  asio::io_context &context() { return context_; }
 
 private:
-  void new_conn(asio::ip::tcp::socket client_conn) noexcept;
-  void do_accept();
+  void wait_eventfd() noexcept;
 
-  RelayEndpoints endpoints_;
-  asio::ip::tcp::acceptor acceptor_;
+  void new_conn(int connfd, const RelayEndpointTuple &endpoint_tuple) noexcept;
+
+  size_t id_;
+  asio::io_context context_;
+  asio::posix::stream_descriptor eventfd_stream_;
+  std::vector<RelayEndpointTuple> endpoint_tuples_;
+};
+
+class RelayServer {
+public:
+  RelayServer(std::vector<RelayEndpointTuple> endpoint_tuples);
+
+  void run(size_t context_num);
+
+private:
+  struct Acceptor {
+    size_t endpoint_idx_;
+    asio::ip::tcp::acceptor acceptor_;
+
+    Acceptor(asio::io_context &context, size_t idx,
+             const asio::ip::tcp::endpoint &endpoint)
+        : endpoint_idx_(idx), acceptor_(context, endpoint) {}
+  };
+
+  void do_accept(Acceptor &acceptor) noexcept;
+
+  std::vector<RelayEndpointTuple> endpoint_tuples_;
+  std::vector<std::shared_ptr<Acceptor>> acceptors_;
+  std::vector<std::shared_ptr<RelayIOContext>> relay_contexts_;
+  size_t relay_context_idx_;
 };

@@ -47,7 +47,7 @@ static void usage(char *argv1) {
 }
 
 struct CommandArgs {
-  std::vector<RelayEndpoints> addr_tuple_list;
+  std::vector<RelayEndpointTuple> addr_tuple_list;
   std::string logfile;
   bool verbose;
 };
@@ -85,15 +85,15 @@ std::vector<std::string> split(const std::string &s, char delim) {
 
 // listen_addr,src_addr,dst_addr/
 // 80,192.168.32.210:8000,192.168.32.251:8000/192.168.32.245:80,192.168.32.251:8000
-static std::vector<RelayEndpoints> parse_addr_tuple(const char *s) {
-  std::vector<RelayEndpoints> addr_tuple_list;
+static std::vector<RelayEndpointTuple> parse_addr_tuple(const char *s) {
+  std::vector<RelayEndpointTuple> addr_tuple_list;
   std::vector<std::string> tuple_str_list = split(s, '/');
   for (const auto &tuple_str : tuple_str_list) {
     std::vector<std::string> addr_str_list = split(tuple_str, ',');
     if (addr_str_list.size() < 2)
       throw std::logic_error("tuple address count must > 2");
 
-    RelayEndpoints t;
+    RelayEndpointTuple t;
     t.listen = parse_addr(addr_str_list[0]);
     if (addr_str_list.size() == 2) {
       t.dst = parse_addr(addr_str_list[1]);
@@ -107,7 +107,7 @@ static std::vector<RelayEndpoints> parse_addr_tuple(const char *s) {
 }
 
 static void
-check_addr_tuple_valid(const std::vector<RelayEndpoints> &addr_tuple_list) {
+check_addr_tuple_valid(const std::vector<RelayEndpointTuple> &addr_tuple_list) {
   for (const auto &t : addr_tuple_list) {
     std::string dst_desc = "dst_addr (" + to_string(t.dst) + ")";
     if (t.dst.port() == 0)
@@ -118,7 +118,7 @@ check_addr_tuple_valid(const std::vector<RelayEndpoints> &addr_tuple_list) {
 }
 
 static void parse_command_line(int argc, char *argv[], CommandArgs &args) {
-  RelayEndpoints addr_tuple;
+  RelayEndpointTuple addr_tuple;
   while (1) {
     int longidnd;
     int c = getopt_long(argc, argv, "l:d:s:r:f:Vh", opts, &longidnd);
@@ -183,15 +183,8 @@ int main(int argc, char *argv[]) {
   LOG_INFO("=== mux start ===");
 
   try {
-    asio::io_context io_context;
-    std::vector<std::unique_ptr<RelayServer>> server_list;
-
-    for (const RelayEndpoints &t : args.addr_tuple_list) {
-      LOG_INFO("Listen on", KV("addr", to_string(t.listen)),
-               KV("src", to_string(t.src)), KV("dst", to_string(t.dst)));
-      server_list.emplace_back(std::make_unique<RelayServer>(io_context, t));
-    }
-    io_context.run();
+    RelayServer s(args.addr_tuple_list);
+    s.run(get_cpu_count());
   } catch (const std::exception &e) {
     LOG_FATAL("Fatal to run mux", KV("error", e.what()));
   }
