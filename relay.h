@@ -57,7 +57,7 @@ private:
 
   RelayConn client_;
   RelayConn server_;
-  TimePoint start_;
+  TimePoint start_time_;
 };
 
 class RelayIOContext : private asio::noncopyable {
@@ -69,7 +69,7 @@ public:
   void run() { context_.run(); }
   void run(std::error_code &ec) { context_.run(ec); }
 
-  void notify(int fd, uint16_t endpoint_idx);
+  void notify(int fd, const RelayEndpointTuple &endpoint_tuple);
 
   asio::io_context &context() { return context_; }
 
@@ -92,12 +92,13 @@ public:
 
 private:
   struct Acceptor {
-    size_t endpoint_idx_;
+    RelayEndpointTuple endpoint_tuple_;
     asio::ip::tcp::acceptor acceptor_;
 
-    Acceptor(asio::io_context &context, size_t idx,
-             const asio::ip::tcp::endpoint &endpoint)
-        : endpoint_idx_(idx), acceptor_(context, endpoint) {}
+    Acceptor(asio::io_context &context,
+             const RelayEndpointTuple &endpoint_tuple)
+        : endpoint_tuple_(endpoint_tuple),
+          acceptor_(context, endpoint_tuple.listen) {}
   };
 
   void do_accept(Acceptor &acceptor) noexcept;

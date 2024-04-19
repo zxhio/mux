@@ -49,7 +49,7 @@ Relay::Relay(tcp::socket client_conn, tcp::socket server_conn,
              const tcp::endpoint &server_raddr)
     : client_(std::move(client_conn), client_laddr, client_raddr),
       server_(std::move(server_conn), server_laddr, server_raddr),
-      start_(std::chrono::system_clock::now()) {
+      start_time_(std::chrono::system_clock::now()) {
   LOG_INFO("Forward", KV("from", to_string(client_raddr)),
            KV("via", to_string(client_laddr)),
            KV("to", to_string(server_raddr)));
@@ -57,7 +57,7 @@ Relay::Relay(tcp::socket client_conn, tcp::socket server_conn,
 
 Relay::~Relay() {
   auto dur = std::chrono::duration_cast<std::chrono::seconds>(
-                 std::chrono::system_clock::now() - start_)
+                 std::chrono::system_clock::now() - start_time_)
                  .count();
   LOG_INFO("Forward done", KV("from", to_string(client_.raddr_)),
            KV("via", to_string(client_.laddr_)),
@@ -148,7 +148,8 @@ RelayIOContext::RelayIOContext(
   wait_eventfd();
 }
 
-void RelayIOContext::notify(int connfd, uint16_t endpoint_idx) {
+void RelayIOContext::notify(int connfd,
+                            const RelayEndpointTuple &endpoint_tuple) {
   eventfd_stream_.async_wait(
       asio::posix::stream_descriptor::wait_write, [this](std::error_code ec) {
         if (ec) {
@@ -161,7 +162,7 @@ void RelayIOContext::notify(int connfd, uint16_t endpoint_idx) {
           LOG_ERROR("Fail to write eventfd", KERR(errno));
       });
 
-  new_conn(connfd, endpoint_tuples_[endpoint_idx]);
+  new_conn(connfd, endpoint_tuple);
 }
 
 void RelayIOContext::wait_eventfd() noexcept {
@@ -182,8 +183,8 @@ void RelayIOContext::wait_eventfd() noexcept {
 void RelayIOContext::new_conn(
     int connfd, const RelayEndpointTuple &endpoint_tuple) noexcept {
   std::error_code ec;
-  tcp::socket client_conn(context_);
-  client_conn.assign(endpoint_tuple.listen.protocol(), connfd, ec);
+  auto client_conn = std::make_shared<tcp::socket>(context_);
+  client_conn->assign(endpoint_tuple.listen.protocol(), connfd, ec);
   if (ec) {
     LOG_ERROR("Fail to make tcp socket", KV("error", ec.message()),
               KV("fd", connfd), KV("efd", eventfd_stream_.native_handle()),
@@ -192,27 +193,26 @@ void RelayIOContext::new_conn(
     return;
   }
 
-  tcp::endpoint client_laddr = client_conn.local_endpoint(ec);
+  tcp::endpoint client_laddr = client_conn->local_endpoint(ec);
   if (ec) {
     LOG_INFO("Fail to get client local addr", KV("err", ec.message()),
-             KV("fd", client_conn.native_handle()));
+             KV("fd", client_conn->native_handle()));
     return;
   }
-  tcp::endpoint client_raddr = client_conn.remote_endpoint(ec);
+  tcp::endpoint client_raddr = client_conn->remote_endpoint(ec);
   if (ec) {
     LOG_INFO("Fail to get client remote addr", KV("err", ec.message()),
              KV("laddr", to_string(client_laddr)),
-             KV("fd", client_conn.native_handle()));
+             KV("fd", client_conn->native_handle()));
     return;
   }
   LOG_INFO("New conn", KV("laddr", to_string(client_laddr)),
            KV("raddr", to_string(client_raddr)), KV("fd", connfd));
 
-  // RelayEndpointTuple endpoint_tuple = endpoint_tuples_[endpoint_idx];
-  tcp::socket server_conn(context_);
+  auto server_conn = std::make_shared<tcp::socket>(context_);
   if (endpoint_tuple.src.port() > 0 ||
       !endpoint_tuple.src.address().is_unspecified()) {
-    server_conn.bind(endpoint_tuple.src, ec);
+    server_conn->bind(endpoint_tuple.src, ec);
     if (ec) {
       LOG_ERROR("Fail to bind", KV("err", ec.message()),
                 KV("src", to_string(endpoint_tuple.src)));
@@ -220,27 +220,29 @@ void RelayIOContext::new_conn(
     }
   }
 
-  server_conn.connect(endpoint_tuple.dst, ec);
-  if (ec) {
-    LOG_ERROR("Fail to connect", KV("error", ec.message()),
-              KV("src", to_string(endpoint_tuple.src)),
-              KV("dst", to_string(endpoint_tuple.dst)));
-    return;
-  }
-  tcp::endpoint server_laddr = server_conn.local_endpoint(ec);
-  if (ec) {
-    LOG_ERROR("Fail to get server local addr", KV("err", ec.message()),
-              KV("fd", server_conn.native_handle()),
-              KV("client_raddr", to_string(client_raddr)));
-    return;
-  }
+  server_conn->async_connect(endpoint_tuple.dst, [=](std::error_code ec) {
+    if (ec) {
+      LOG_ERROR("Fail to connect", KV("error", ec.message()),
+                KV("src", to_string(endpoint_tuple.src)),
+                KV("dst", to_string(endpoint_tuple.dst)));
+      return;
+    }
 
-  LOG_DEBUG("Connected to", KV("laddr", to_string(server_laddr)),
-            KV("raddr", to_string(endpoint_tuple.dst)));
-  std::make_shared<Relay>(std::move(client_conn), std::move(server_conn),
-                          client_laddr, client_raddr, server_laddr,
-                          endpoint_tuple.dst)
-      ->start();
+    tcp::endpoint server_laddr = server_conn->local_endpoint(ec);
+    if (ec) {
+      LOG_ERROR("Fail to get server local addr", KV("err", ec.message()),
+                KV("fd", server_conn->native_handle()),
+                KV("client_raddr", to_string(client_raddr)));
+      return;
+    }
+    LOG_DEBUG("Connected to", KV("laddr", to_string(server_laddr)),
+              KV("raddr", to_string(endpoint_tuple.dst)));
+
+    std::make_shared<Relay>(std::move(*client_conn), std::move(*server_conn),
+                            client_laddr, client_raddr, client_raddr,
+                            endpoint_tuple.dst)
+        ->start();
+  });
 }
 
 RelayServer::RelayServer(std::vector<RelayEndpointTuple> endpoint_tuples)
@@ -254,12 +256,10 @@ void RelayServer::run(size_t co_num) {
     relay_contexts_.emplace_back(
         std::make_shared<RelayIOContext>(i, endpoint_tuples_));
 
-  for (size_t i = 0; i < endpoint_tuples_.size(); i++) {
-    auto et = endpoint_tuples_[i];
+  for (const auto &et : endpoint_tuples_) {
     LOG_INFO("Listen on", KV("addr", to_string(et.listen)),
              KV("via", to_string(et.src)), KV("to", to_string(et.dst)));
-    auto a =
-        std::make_shared<Acceptor>(relay_contexts_[0]->context(), i, et.listen);
+    auto a = std::make_shared<Acceptor>(relay_contexts_[0]->context(), et);
     do_accept(*a);
     acceptors_.emplace_back(a);
   }
@@ -284,7 +284,7 @@ void RelayServer::do_accept(Acceptor &ra) noexcept {
         if (relay_context_idx_ % relay_contexts_.size() == 0)
           relay_context_idx_++;
         auto ctx = relay_contexts_[relay_context_idx_ % relay_contexts_.size()];
-        ctx->notify(connfd, ra.endpoint_idx_);
+        ctx->notify(connfd, ra.endpoint_tuple_);
 
         do_accept(ra);
       });
