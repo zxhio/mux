@@ -10,6 +10,7 @@
 #pragma once
 
 #include <asio/ip/tcp.hpp>
+#include <asio/streambuf.hpp>
 
 struct RelayEndpoints {
   asio::ip::tcp::endpoint listen;
@@ -32,7 +33,9 @@ struct RelayConn {
 
 class Relay : public std::enable_shared_from_this<Relay> {
 public:
-  using SharedBuffer = std::shared_ptr<std::vector<char>>;
+  using SharedBuffer = std::shared_ptr<asio::streambuf>;
+  using TimePoint = std::chrono::time_point<std::chrono::system_clock,
+                                            std::chrono::nanoseconds>;
 
   Relay(asio::ip::tcp::socket client_conn, asio::ip::tcp::socket server_conn,
         const asio::ip::tcp::endpoint &client_laddr,
@@ -45,10 +48,15 @@ public:
   void start() noexcept;
 
 private:
-  void io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf) noexcept;
+  void io_copy(RelayConn &from, RelayConn &to, SharedBuffer buf,
+               bool need_grow) noexcept;
+
+  void write_all(RelayConn &from, RelayConn &to, SharedBuffer buf,
+                 bool need_grow) noexcept;
 
   RelayConn client_;
   RelayConn server_;
+  TimePoint start_;
 };
 
 class RelayServer {
