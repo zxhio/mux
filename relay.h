@@ -67,20 +67,20 @@ public:
                  const std::vector<RelayEndpointTuple> &endpoint_tuples);
 
   void run() { context_.run(); }
-  void run(std::error_code &ec) { context_.run(ec); }
-
-  void notify(int fd, const RelayEndpointTuple &endpoint_tuple);
-
-  asio::io_context &context() { return context_; }
-
-private:
-  void wait_eventfd() noexcept;
 
   void new_conn(int connfd, const RelayEndpointTuple &endpoint_tuple) noexcept;
 
+  asio::io_context &context() { return context_; }
+
+public:
+  static const std::chrono::seconds kTimerExpirySeconds;
+
+private:
+  void wait_timer() noexcept;
+
   size_t id_;
   asio::io_context context_;
-  asio::posix::stream_descriptor eventfd_stream_;
+  asio::steady_timer timer_; // keep io_context not empty
   std::vector<RelayEndpointTuple> endpoint_tuples_;
 };
 
@@ -88,7 +88,7 @@ class RelayServer {
 public:
   RelayServer(std::vector<RelayEndpointTuple> endpoint_tuples);
 
-  void run(size_t context_num);
+  void run(size_t co_num);
 
 private:
   struct Acceptor {

@@ -125,59 +125,20 @@ void Relay::write_all(RelayConn &from, RelayConn &to, SharedBuffer buf,
       });
 }
 
-static int create_eventfd(std::error_code &ec) noexcept {
-  int efd = eventfd(0, O_NONBLOCK);
-  if (efd < 0) {
-    ec = std::error_code(errno, std::system_category());
-    return -1;
-  }
-  return efd;
-}
-
-static int create_eventfd() {
-  std::error_code ec;
-  int efd = create_eventfd(ec);
-  asio::detail::throw_error(ec);
-  return efd;
-}
+const std::chrono::seconds RelayIOContext::kTimerExpirySeconds(10);
 
 RelayIOContext::RelayIOContext(
     size_t id, const std::vector<RelayEndpointTuple> &endpoint_tuples)
-    : id_(id), context_(), eventfd_stream_(context_, create_eventfd()),
+    : id_(id), context_(), timer_(context_, kTimerExpirySeconds),
       endpoint_tuples_(endpoint_tuples) {
-  wait_eventfd();
+  wait_timer();
 }
 
-void RelayIOContext::notify(int connfd,
-                            const RelayEndpointTuple &endpoint_tuple) {
-  eventfd_stream_.async_wait(
-      asio::posix::stream_descriptor::wait_write, [this](std::error_code ec) {
-        if (ec) {
-          LOG_ERROR("Fail to async_wait", KV("error", ec.message()));
-          return;
-        }
-
-        LOG_DEBUG("Notify io_context", KV("id", id_));
-        if (::eventfd_write(eventfd_stream_.native_handle(), 1) < 0)
-          LOG_ERROR("Fail to write eventfd", KERR(errno));
-      });
-
-  new_conn(connfd, endpoint_tuple);
-}
-
-void RelayIOContext::wait_eventfd() noexcept {
-  eventfd_stream_.async_wait(
-      asio::posix::stream_descriptor::wait_read, [this](std::error_code ec) {
-        if (ec) {
-          LOG_ERROR("Fail to async_wait eventfd", KV("error", ec.message()));
-          return;
-        }
-
-        uint64_t v;
-        ::eventfd_read(eventfd_stream_.native_handle(), &v);
-
-        wait_eventfd();
-      });
+void RelayIOContext::wait_timer() noexcept {
+  timer_.async_wait([this](std::error_code ec) {
+    timer_.expires_after(kTimerExpirySeconds);
+    wait_timer();
+  });
 }
 
 void RelayIOContext::new_conn(
@@ -187,8 +148,7 @@ void RelayIOContext::new_conn(
   client_conn->assign(endpoint_tuple.listen.protocol(), connfd, ec);
   if (ec) {
     LOG_ERROR("Fail to make tcp socket", KV("error", ec.message()),
-              KV("fd", connfd), KV("efd", eventfd_stream_.native_handle()),
-              KV("id", id_));
+              KV("fd", connfd), KV("id", id_));
     ::close(connfd);
     return;
   }
@@ -284,7 +244,7 @@ void RelayServer::do_accept(Acceptor &ra) noexcept {
         if (relay_context_idx_ % relay_contexts_.size() == 0)
           relay_context_idx_++;
         auto ctx = relay_contexts_[relay_context_idx_ % relay_contexts_.size()];
-        ctx->notify(connfd, ra.endpoint_tuple_);
+        ctx->new_conn(connfd, ra.endpoint_tuple_);
 
         do_accept(ra);
       });
